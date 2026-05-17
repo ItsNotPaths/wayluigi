@@ -1,6 +1,6 @@
 # luigi
 
-A barebones single-header GUI library for Win32, X11 and Essence. 
+A barebones single-header GUI library for Win32, X11, [+Wayland], and Essence. 
 
 ## Projects made with luigi
 

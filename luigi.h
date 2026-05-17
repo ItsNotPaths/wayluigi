@@ -12171,11 +12171,6 @@ void _UIClipboardReadTextEnd(UIWindow *window, char *text) {
 
 #endif
 
-// ============================================================================
-// UI_WAYLAND backend (wayluigi). Stubs only; see PLAN.md for the
-// 10-step plan and /home/paths/.claude/plans/ for the MVP slice.
-// ============================================================================
-
 #ifdef UI_WAYLAND
 
 #define WAYLUIGI_STUB(name) do { \
@@ -12203,8 +12198,6 @@ const int UI_KEYCODE_TAB = XKB_KEY_Tab;
 const int UI_KEYCODE_UP = XKB_KEY_Up;
 const int UI_KEYCODE_INSERT = XKB_KEY_Insert;
 
-// ----- SHM buffer management -----
-
 static int _UIWaylandCreateShmFd(int size) {
 	static int counter = 0;
 	char name[64];
@@ -12223,9 +12216,6 @@ static int _UIWaylandCreateShmFd(int size) {
 	return fd;
 }
 
-// Allocate a new shm-backed wl_buffer at (width, height) and bind it as
-// window->bufferFront / window->bits / window->shmData. Frees any prior
-// allocation. Returns 0 on success, -1 on failure.
 static int _UIWaylandReallocBuffer(UIWindow *window, int width, int height) {
 	if (width <= 0 || height <= 0) return -1;
 	int stride = width * 4;
@@ -12249,9 +12239,7 @@ static int _UIWaylandReallocBuffer(UIWindow *window, int width, int height) {
 	if (window->shmData && window->shmSize) {
 		munmap(window->shmData, window->shmSize);
 	} else if (window->bits) {
-		// Pre-show menus use a malloc'd scratch buffer; free it now
-		// that we're switching to a real SHM-backed wl_buffer.
-		free(window->bits);
+		free(window->bits); // pre-show menu scratch buffer.
 	}
 
 	window->bufferFront = buffer;
@@ -12262,8 +12250,6 @@ static int _UIWaylandReallocBuffer(UIWindow *window, int width, int height) {
 	window->height = height;
 	return 0;
 }
-
-// ----- Listeners -----
 
 static void _UIWaylandXdgWmBasePing(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
 	xdg_wm_base_pong(wm_base, serial);
@@ -12325,10 +12311,7 @@ static const struct xdg_surface_listener _UIWaylandXdgSurfaceListener = {
 	_UIWaylandXdgSurfaceConfigure,
 };
 
-// Fractional scale: scale is delivered as numerator-of-fraction-over-
-// 120, so a scale of 180 means 1.5×. Stash and mark dirty; the main
-// loop applies it via _UIWaylandProcessPendingForWindow.
-
+// scaleNum is the numerator over 120; 180 means 1.5×.
 static void _UIWaylandFractionalScalePreferred(void *data, struct wp_fractional_scale_v1 *scale, uint32_t scaleNum) {
 	UIWindow *window = (UIWindow *) data;
 	if (window->pendingScale == (int) scaleNum) return;
@@ -12339,12 +12322,6 @@ static void _UIWaylandFractionalScalePreferred(void *data, struct wp_fractional_
 static const struct wp_fractional_scale_v1_listener _UIWaylandFractionalScaleListener = {
 	_UIWaylandFractionalScalePreferred,
 };
-
-// xdg_popup listener: configure carries placement+size (we use only
-// size; the compositor's chosen x/y is already encoded in the
-// positioner). popup_done fires when the compositor dismisses the
-// popup (click-outside, Esc, etc.) and is treated as the user
-// closing the menu.
 
 static void _UIWaylandXdgPopupConfigure(void *data, struct xdg_popup *popup,
 		int32_t x, int32_t y, int32_t width, int32_t height) {
@@ -12369,10 +12346,7 @@ static const struct xdg_popup_listener _UIWaylandXdgPopupListener = {
 	_UIWaylandXdgPopupRepositioned,
 };
 
-// ----- Input: cursor theme, pointer, keyboard, seat -----
-//
-// evdev button codes from <linux/input-event-codes.h>, inlined to avoid
-// pulling in the kernel headers package as a build dep.
+// evdev codes; inlined to avoid a dep on <linux/input-event-codes.h>.
 #define _UI_BTN_LEFT   0x110
 #define _UI_BTN_RIGHT  0x111
 #define _UI_BTN_MIDDLE 0x112
@@ -12397,10 +12371,7 @@ static UIWindow *_UIWaylandFindWindow(struct wl_surface *surface) {
 	return NULL;
 }
 
-// luigi cursor → cursor-shape-v1 shape enum. Ordered to match
-// UI_CURSOR_* enum values exactly (positional initializers, since
-// designated-array-initializers aren't accepted by g++ in C++ mode
-// and this header is included from C++ examples too).
+// Positional initializers — designated-array-initializers don't survive g++.
 static const uint32_t _UIWaylandCursorShapeMap[UI_CURSOR_COUNT] = {
 	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT,       // UI_CURSOR_ARROW
 	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT,          // UI_CURSOR_TEXT
@@ -12423,8 +12394,6 @@ static void _UIWaylandApplyCursor(int cursorId) {
 	if (cursorId < 0 || cursorId >= UI_CURSOR_COUNT) cursorId = UI_CURSOR_ARROW;
 	if (!ui.pointer) return;
 
-	// Prefer cursor-shape-v1 if the compositor advertised it. The
-	// compositor draws the cursor itself, no buffer/theme on our side.
 	if (ui.cursorShapeDevice) {
 		wp_cursor_shape_device_v1_set_shape(ui.cursorShapeDevice,
 				_UIWaylandCursor.lastEnterSerial, _UIWaylandCursorShapeMap[cursorId]);
@@ -12450,8 +12419,6 @@ static void _UIWaylandApplyCursor(int cursorId) {
 }
 
 static void _UIWaylandLoadCursors() {
-	// Cursor theme size and name come from the user's env; falling back
-	// to 24px is fine for most HiDPI-ish defaults.
 	const char *themeName = getenv("XCURSOR_THEME");
 	int size = 24;
 	const char *sizeEnv = getenv("XCURSOR_SIZE");
@@ -12463,10 +12430,6 @@ static void _UIWaylandLoadCursors() {
 	_UIWaylandCursor.theme = wl_cursor_theme_load(themeName, size, ui.shm);
 	_UIWaylandCursor.surface = wl_compositor_create_surface(ui.compositor);
 
-	// X11 cursorfont names; wl_cursor themes typically still ship these
-	// or alias them to CSS-style names. Positional initializers ordered
-	// to match UI_CURSOR_* values — designated-array-initializers don't
-	// survive a C++ compile.
 	static const char *const names[UI_CURSOR_COUNT] = {
 		"left_ptr",            // UI_CURSOR_ARROW
 		"xterm",               // UI_CURSOR_TEXT
@@ -12490,13 +12453,6 @@ static void _UIWaylandLoadCursors() {
 	}
 }
 
-// Pointer listener
-
-// On windows with a viewport, surface-local pointer coords arrive in
-// the logical (set_destination) coord system; multiply by scale to
-// land in buffer-pixel coords that luigi's bounds/clip use. For
-// windows without a viewport, scale defaults to 1.0, so the helper
-// is a no-op.
 static inline int _UIWaylandFixedToBufferPx(UIWindow *window, wl_fixed_t v) {
 	return (int) (wl_fixed_to_double(v) * window->scale + 0.5);
 }
@@ -12555,9 +12511,7 @@ static void _UIWaylandPointerAxis(void *data, struct wl_pointer *pointer, uint32
 	UIWindow *window = _UIWaylandPointerFocus;
 	if (!window) return;
 	if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) return;
-	// Wayland: positive value = scroll down. luigi: positive di = scroll
-	// down too. ~10.0 fixed per notch; luigi expects ~72 per notch.
-	int di = wl_fixed_to_int(value) * 7;
+	int di = wl_fixed_to_int(value) * 7; // ~10 fixed/notch → luigi's ~72/notch.
 	if (di == 0) return;
 	_UIWindowInputEvent(window, UI_MSG_MOUSE_WHEEL, di, 0);
 }
@@ -12582,8 +12536,6 @@ static const struct wl_pointer_listener _UIWaylandPointerListener = {
 	_UIWaylandPointerAxisValue120,
 	_UIWaylandPointerAxisRelativeDirection,
 };
-
-// Keyboard listener
 
 static void _UIWaylandKeyboardKeymap(void *data, struct wl_keyboard *keyboard,
 		uint32_t format, int32_t fd, uint32_t size) {
@@ -12671,7 +12623,6 @@ static void _UIWaylandKeyboardModifiers(void *data, struct wl_keyboard *keyboard
 
 static void _UIWaylandKeyboardRepeatInfo(void *data, struct wl_keyboard *keyboard,
 		int32_t rate, int32_t delay) {
-	// MVP: key repeat handled by compositor or skipped.
 }
 
 static const struct wl_keyboard_listener _UIWaylandKeyboardListener = {
@@ -12683,12 +12634,6 @@ static const struct wl_keyboard_listener _UIWaylandKeyboardListener = {
 	_UIWaylandKeyboardRepeatInfo,
 };
 
-// Seat listener — binds pointer / keyboard when capabilities arrive.
-
-// Set up a cursor-shape device on the pointer if both have been
-// bound. Idempotent for the same reason _UIWaylandEnsureDataDevice
-// is — bind order between registry and seat-capabilities events is
-// not guaranteed.
 static void _UIWaylandEnsureCursorShapeDevice(void) {
 	if (ui.cursorShapeDevice) return;
 	if (!ui.cursorShapeManager || !ui.pointer) return;
@@ -12728,19 +12673,6 @@ static const struct wl_seat_listener _UIWaylandSeatListener = {
 	_UIWaylandSeatName,
 };
 
-// ----- Clipboard: wl_data_device_manager -----
-//
-// Receive side: data_device.data_offer announces a new wl_data_offer;
-// per-offer state tracks the best text mime type seen so far via the
-// offer.offer events that follow. data_device.selection promotes one
-// of those offers (or NULL) to be the current clipboard contents.
-//
-// Send side: WriteText creates a wl_data_source, advertises text mime
-// types, and set_selection's it with the most recent input serial.
-// data_source.send fires when another client (or this client, via
-// the receive path) asks for the contents; we write pasteText to the
-// supplied fd and close it.
-
 #define _UI_CLIPBOARD_READ_TIMEOUT_MS 1000
 
 typedef struct _UIWaylandClipboardOffer {
@@ -12752,7 +12684,6 @@ typedef struct _UIWaylandClipboardOffer {
 static void _UIWaylandDataOfferOffer(void *data, struct wl_data_offer *offer, const char *mimeType) {
 	_UIWaylandClipboardOffer *info = (_UIWaylandClipboardOffer *) data;
 	if (!info) return;
-	// Preference order: utf-8 explicit > text/plain > UTF8_STRING.
 	int priority = 0;
 	if (!strcmp(mimeType, "UTF8_STRING")) priority = 1;
 	else if (!strcmp(mimeType, "text/plain")) priority = 2;
@@ -12789,21 +12720,9 @@ static void _UIWaylandDataDeviceSelection(void *data, struct wl_data_device *dev
 	ui.selectionOffer = offer;
 }
 
-// ----- DnD reception (file drops) -----
-//
-// Sequence: enter(offer) → motion* → (drop | leave). On enter we
-// inspect the per-offer info (already populated by data_offer.offer
-// events) for text/uri-list support; on motion we accept the mime
-// type so the peer renders a "drop OK" cursor; on drop we read the
-// URI list and deliver UI_MSG_WINDOW_DROP_FILES. Leave without drop
-// just clears state.
-
 static void _UIWaylandDeliverDroppedFiles(UIWindow *window, char *buffer, size_t len) {
 	if (len == 0) return;
 
-	// text/uri-list lines are separated by CRLF. Lines starting with '#'
-	// are comments per RFC 2483 and skipped. Each remaining line is a
-	// URI; we accept only file:// and percent-decode in place.
 	int capacity = 16;
 	int count = 0;
 	char **files = (char **) malloc(sizeof(char *) * capacity);
@@ -12814,7 +12733,6 @@ static void _UIWaylandDeliverDroppedFiles(UIWindow *window, char *buffer, size_t
 		size_t start = i;
 		while (i < len && buffer[i] != '\r' && buffer[i] != '\n') i++;
 		size_t lineEnd = i;
-		// Skip CR/LF terminator(s).
 		while (i < len && (buffer[i] == '\r' || buffer[i] == '\n')) i++;
 
 		if (lineEnd == start) continue;
@@ -12824,7 +12742,6 @@ static void _UIWaylandDeliverDroppedFiles(UIWindow *window, char *buffer, size_t
 		if (strncmp(line, "file://", 7) != 0) continue;
 		char *path = line + 7;
 
-		// Percent-decode in place.
 		char *src = path, *dst = path;
 		while (*src) {
 			if (src[0] == '%' && src[1] && src[2]) {
@@ -12865,8 +12782,6 @@ static void _UIWaylandDataDeviceEnter(void *data, struct wl_data_device *device,
 	ui.dndOffer = offer;
 	ui.dndWindow = window;
 
-	// Accept text/uri-list if advertised. The compositor uses our
-	// accept() response to decide whether to show a "drop OK" cursor.
 	const char *mime = (info && info->hasUriList) ? "text/uri-list" : NULL;
 	wl_data_offer_set_actions(offer,
 			WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
@@ -12886,8 +12801,6 @@ static void _UIWaylandDataDeviceLeave(void *data, struct wl_data_device *device)
 
 static void _UIWaylandDataDeviceMotion(void *data, struct wl_data_device *device,
 		uint32_t time, wl_fixed_t x, wl_fixed_t y) {
-	// Could update a hover state per element here; for the MVP we just
-	// keep the accept from enter alive.
 }
 
 static void _UIWaylandDataDeviceDrop(void *data, struct wl_data_device *device) {
@@ -12895,7 +12808,6 @@ static void _UIWaylandDataDeviceDrop(void *data, struct wl_data_device *device) 
 
 	_UIWaylandClipboardOffer *info = (_UIWaylandClipboardOffer *) wl_data_offer_get_user_data(ui.dndOffer);
 	if (!info || !info->hasUriList) {
-		// Nothing usable; tell the source we declined and unwind.
 		wl_data_offer_destroy(ui.dndOffer);
 		free(info);
 		ui.dndOffer = NULL;
@@ -12935,8 +12847,6 @@ static void _UIWaylandDataDeviceDrop(void *data, struct wl_data_device *device) 
 	close(fds[0]);
 
 	if (buf) {
-		// Need an extra byte for the in-place terminator the parser
-		// writes when consuming the final line.
 		if (len + 1 > cap) {
 			char *nb = (char *) realloc(buf, len + 1);
 			if (nb) buf = nb;
@@ -12996,9 +12906,6 @@ static const struct wl_data_source_listener _UIWaylandDataSourceListener = {
 	_UIWaylandDataSourceAction,
 };
 
-// Idempotent: callable from whichever of seat/manager binds last. Bind
-// order isn't guaranteed in the registry, so each binding site calls
-// this and the second one to arrive wins.
 static void _UIWaylandEnsureDataDevice(void) {
 	if (ui.dataDevice) return;
 	if (!ui.dataDeviceManager || !ui.seat) return;
@@ -13032,11 +12939,9 @@ static void _UIWaylandRegistryGlobal(void *data, struct wl_registry *registry,
 	} else if (!strcmp(interface, wp_viewporter_interface.name)) {
 		ui.viewporter = (struct wp_viewporter *) wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
 	}
-	// wl_output deferred (multi-monitor positioning).
 }
 
 static void _UIWaylandRegistryGlobalRemove(void *data, struct wl_registry *registry, uint32_t name) {
-	// MVP: don't track removals.
 }
 
 static const struct wl_registry_listener _UIWaylandRegistryListener = {
@@ -13044,29 +12949,15 @@ static const struct wl_registry_listener _UIWaylandRegistryListener = {
 	_UIWaylandRegistryGlobalRemove,
 };
 
-// ----- Pending-configure processing -----
-//
-// The pattern from PLAN.md: configure handlers (inside dispatch) only
-// update `pending*` fields. After wl_display_dispatch returns to the
-// main loop, _UIWaylandProcessPending walks the window list and applies
-// the latest pending state: reallocate buffer if size changed, layout,
-// ack_configure, then paint via _UIUpdate (whose UI_MSG_PAINT path
-// terminates in _UIWindowEndPaint, which attaches+damages+commits).
-
 static void _UIWaylandProcessPendingForWindow(UIWindow *window) {
 	if (!window->pendingDirty) return;
 
-	// On windows with a viewport, configure dimensions are LOGICAL
-	// (compositor scale-aware) and the buffer must be allocated at
-	// logical × fractional_scale. Without a viewport, the surface is
-	// interpreted at buffer pixels, so logical == buffer.
 	int scaleNum = window->pendingScale ? window->pendingScale : 120;
 	float scale = (float) scaleNum / 120.0f;
 
 	int logW = window->pendingWidth;
 	int logH = window->pendingHeight;
 	if (logW <= 0 || logH <= 0) {
-		// Compositor said "client picks": use existing or default.
 		int existingLogW = window->viewport ? (int) (window->width / scale) : window->width;
 		int existingLogH = window->viewport ? (int) (window->height / scale) : window->height;
 		logW = existingLogW > 0 ? existingLogW : 800;
@@ -13093,11 +12984,7 @@ static void _UIWaylandProcessPendingForWindow(UIWindow *window) {
 
 	xdg_surface_ack_configure(window->xdgSurface, window->pendingConfigureSerial);
 	window->pendingDirty = false;
-
-	// ack_configure obligates the next commit to apply the new state.
-	// Paint immediately so the resize state machine doesn't stall
-	// (PLAN.md "Ack without commit" failure mode).
-	_UIUpdate();
+	_UIUpdate(); // ack obligates a commit; don't stall the resize FSM.
 }
 
 static void _UIWaylandProcessPending() {
@@ -13107,8 +12994,6 @@ static void _UIWaylandProcessPending() {
 		window = window->next;
 	}
 }
-
-// ----- Per-backend window message handler -----
 
 int _UIWindowMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	if (message == UI_MSG_DESTROY) {
@@ -13120,8 +13005,6 @@ int _UIWindowMessage(UIElement *element, UIMessage message, int di, void *dp) {
 		if (window->shmData && window->shmSize) {
 			munmap(window->shmData, window->shmSize);
 		} else if (window->bits) {
-			// Menus whose buffer never got upgraded to SHM (e.g.
-			// destroyed before UIMenuShow ran).
 			free(window->bits);
 		}
 		if (window->xdgPopup) xdg_popup_destroy(window->xdgPopup);
@@ -13134,8 +13017,6 @@ int _UIWindowMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	}
 	return _UIWindowMessageCommon(element, message, di, dp);
 }
-
-// ----- Public entry points -----
 
 void UIInitialise() {
 	_UIInitialiseCommon();
@@ -13158,12 +13039,7 @@ void UIInitialise() {
 
 	ui.xkbContext = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
-	// Second roundtrip: wl_seat.capabilities arrives async after the
-	// seat is bound, so we round-trip again to receive it and bind
-	// pointer/keyboard before returning control to the caller.
-	wl_display_roundtrip(ui.display);
-
-	// Cursor theme must come after we have ui.shm + ui.compositor bound.
+	wl_display_roundtrip(ui.display); // pick up wl_seat.capabilities.
 	_UIWaylandLoadCursors();
 }
 
@@ -13176,18 +13052,10 @@ UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, in
 	window->waylandOwner = owner;
 
 	if (flags & UI_WINDOW_MENU) {
-		// Menus become xdg_popups, which need the parent's xdg_surface
-		// AND the menu's final size to construct an xdg_positioner.
-		// Both are only known at UIMenuShow time, so we defer the
-		// xdg_surface/xdg_popup chain to there. Until then, give the
-		// menu a tiny malloc'd scratch buffer so luigi's renderer can
-		// safely write into window->bits during element setup; the
-		// scratch is freed when _UIWaylandReallocBuffer swaps in the
-		// real SHM buffer from UIMenuShow.
+		// xdg_popup/positioner deferred to UIMenuShow (needs parent surface + size).
+		// Scratch buffer keeps luigi's renderer from null-derefing until then.
 		window->isMenu = true;
 		window->surface = wl_compositor_create_surface(ui.compositor);
-		// Inherit parent's scale for buffer sizing and positioner math;
-		// preferred_scale events from the compositor will override.
 		window->pendingScale = owner ? (int) (owner->scale * 120.0f + 0.5f) : 120;
 		if (window->pendingScale <= 0) window->pendingScale = 120;
 		if (ui.fractionalScaleManager && ui.viewporter) {
@@ -13214,11 +13082,6 @@ UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, in
 	window->xdgToplevel = xdg_surface_get_toplevel(window->xdgSurface);
 	xdg_toplevel_add_listener(window->xdgToplevel, &_UIWaylandXdgToplevelListener, window);
 
-	// Fractional scale + viewport: both must be present to do anything
-	// useful (fractional_scale tells us the scale; viewport lets us
-	// declare buffer-to-logical mapping). When either is missing we
-	// fall through to integer-1.0 behavior: configure sizes are buffer
-	// pixels, pointer coords are buffer pixels.
 	window->pendingScale = 120;
 	if (ui.fractionalScaleManager && ui.viewporter) {
 		window->fractionalScale = wp_fractional_scale_manager_v1_get_fractional_scale(
@@ -13231,18 +13094,11 @@ UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, in
 	if (cTitle) xdg_toplevel_set_title(window->xdgToplevel, cTitle);
 	xdg_toplevel_set_app_id(window->xdgToplevel, "wayluigi");
 
-	// If the caller supplied an owner toplevel, advertise the
-	// parent/child relationship so the compositor can stack them
-	// together and treat the owner as the "main" window when the
-	// child gains focus.
 	if (owner && owner->xdgToplevel) {
 		xdg_toplevel_set_parent(window->xdgToplevel, owner->xdgToplevel);
 	}
 
-	// Request server-side decorations. Mutter/KWin will honor this and
-	// draw a real titlebar+close button; Sway/Hyprland will refuse
-	// (replying CLIENT_SIDE) and the window will be borderless. We don't
-	// draw client-side decorations yet — that's a TODO.
+	// SSD only; CSD not implemented. Mutter refuses → borderless.
 	if (ui.xdgDecorationManager) {
 		window->xdgDecoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
 				ui.xdgDecorationManager, window->xdgToplevel);
@@ -13250,18 +13106,9 @@ UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, in
 				ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
 	}
 
-	// Initial dimensions before the first configure arrives. They may be
-	// overridden when the compositor proposes a different size.
 	window->pendingWidth = width;
 	window->pendingHeight = height;
-
-	// xdg_shell requires the initial commit have no buffer. The compositor
-	// responds with a configure carrying the agreed-upon size.
-	wl_surface_commit(window->surface);
-
-	// Block here until first configure arrives and is applied. This gives
-	// callers a window with valid width/height/bits before they start
-	// creating child elements against it.
+	wl_surface_commit(window->surface); // xdg_shell: first commit must be buffer-less.
 	wl_display_roundtrip(ui.display);
 	_UIWaylandProcessPendingForWindow(window);
 
@@ -13275,26 +13122,14 @@ bool _UIMessageLoopSingle(int *result) {
 		return false;
 	}
 	_UIWaylandProcessPending();
-	// Always repaint after a dispatch: input handlers (clicks, hovers,
-	// keypresses) dirty regions via UIElementRepaint but don't run a
-	// paint themselves. Without this call those changes only hit the
-	// screen the next time something else woke a redraw.
-	_UIUpdate();
+	_UIUpdate(); // input handlers dirty regions but don't paint themselves.
 	return !ui.quit;
 }
 
 void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
 	if (!window->bufferFront) return;
-	// _UIElementPaint mutates painter->clip during recursion, so by the
-	// time we get here painter->clip is whatever rectangle the last
-	// painted leaf settled on — usually a tiny fragment of the actual
-	// dirty area. Use the window's accumulated updateRegion instead,
-	// which is what _UIUpdate used to seed the painter in the first
-	// place. (X11 has the same logical bug in its _UIWindowEndPaint
-	// but X11 servers redraw the whole window from a backing store, so
-	// nothing visibly breaks. On Wayland the undamaged regions of the
-	// buffer keep their previous on-screen content — that's where the
-	// drag-trail ghosts come from.)
+	// HACK: painter->clip is mutated by _UIElementPaint recursion. Damage
+	// from window->updateRegion instead, or drag trails ghost on Wayland.
 	UIRectangle r = UIRectangleIntersection(window->updateRegion,
 			UI_RECT_2S(window->width, window->height));
 	if (!UI_RECT_VALID(r)) return;
@@ -13306,15 +13141,7 @@ void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
 	wl_surface_commit(window->surface);
 }
 
-// ----- Remaining backend hooks (stubs until later steps) -----
-
-// X11 implements this as XResizeWindow, which is itself only a
-// request the WM may override. The Wayland analogue is to constrain
-// the toplevel's size hints to a single point: set_min_size ==
-// set_max_size == (w, h), commit. Compositors that honor strict
-// hints (Sway, KWin) will send a configure at that size on the next
-// cycle; ones that don't (tiling/maximized layouts) will ignore it,
-// matching X11's "WM gets the final word" semantics.
+// Best-effort: compositor may ignore (X11's XResizeWindow same caveat).
 void UIWindowPack(UIWindow *window, int _width) {
 	if (!window->xdgToplevel) return;
 	int width = _width ? _width : UIElementMessage(window->e.children, UI_MSG_GET_WIDTH, 0, 0);
@@ -13325,20 +13152,7 @@ void UIWindowPack(UIWindow *window, int _width) {
 	wl_surface_commit(window->surface);
 }
 
-// TODO: Thread-safe message posting from a worker thread to the UI
-// thread. No example in this repo uses it, and luigi never calls it
-// internally; it's a hook for user apps that do background I/O.
-// Correct Wayland implementation needs:
-//   1. A wakeup fd (eventfd or self-pipe) on `ui`, written from
-//      whichever thread calls UIWindowPostMessage.
-//   2. A mutex-protected queue of pending (window, message, dp)
-//      records.
-//   3. _UIMessageLoopSingle restructured to wl_display_prepare_read
-//      / poll(wayland_fd + wake_fd) / wl_display_read_events,
-//      draining the wake fd's queue when it fires.
-//   4. -lpthread added to the documented build line.
-// X11's own implementation is a HACK (XSendEvent of a forged
-// KeyPress) which has no Wayland equivalent.
+// TODO eventfd wakeup + mutex-protected queue + prepare_read/poll loop + -lpthread.
 void UIWindowPostMessage(UIWindow *window, UIMessage message, void *_dp) {
 	WAYLUIGI_STUB("UIWindowPostMessage");
 }
@@ -13346,11 +13160,7 @@ void UIWindowPostMessage(UIWindow *window, UIMessage message, void *_dp) {
 void UIMenuShow(UIMenu *menu) {
 	UIWindow *window = menu->e.window;
 	UIWindow *parent = window->waylandOwner;
-	if (!parent || !parent->xdgSurface) {
-		// Owner isn't a real toplevel — no surface to anchor on. Bail
-		// cleanly rather than producing a protocol error.
-		return;
-	}
+	if (!parent || !parent->xdgSurface) return;
 
 	int width, height;
 	_UIMenuPrepare(menu, &width, &height);
@@ -13363,11 +13173,7 @@ void UIMenuShow(UIMenu *menu) {
 	UIElementMessage(&window->e, UI_MSG_LAYOUT, 0, 0);
 	window->updateRegion = UI_RECT_2S(window->width, window->height);
 
-	// xdg_positioner operates in parent's LOGICAL coords, so divide
-	// buffer-pixel sizes/positions by parent->scale. The viewport
-	// declares the menu's buffer-to-logical mapping so its own surface
-	// matches the positioner's logical size. menu->pointX/Y are stored
-	// in parent's buffer pixels (luigi's internal coord system).
+	// xdg_positioner operates in parent's logical coords.
 	float parentScale = parent->scale > 0.0f ? parent->scale : 1.0f;
 	float menuScale = window->scale > 0.0f ? window->scale : 1.0f;
 	int logW = (int) (width / menuScale + 0.5f);
@@ -13395,19 +13201,10 @@ void UIMenuShow(UIMenu *menu) {
 	xdg_popup_add_listener(window->xdgPopup, &_UIWaylandXdgPopupListener, window);
 	xdg_positioner_destroy(positioner);
 
-	// Grab on the seat using the most recent input serial we know
-	// about (pointer enter). xdg_popup.grab establishes click-outside
-	// dismissal; only the topmost popup in a chain should grab, but
-	// for the MVP every menu requests it — submenus inherit the
-	// parent's grab implicitly.
 	if (ui.seat && _UIWaylandCursor.lastEnterSerial) {
 		xdg_popup_grab(window->xdgPopup, ui.seat, _UIWaylandCursor.lastEnterSerial);
 	}
 
-	// Initial commit must be buffer-less (xdg_shell protocol). The
-	// compositor responds with configure events; the next dispatch
-	// cycle calls _UIWaylandProcessPendingForWindow which acks and
-	// paints.
 	wl_surface_commit(window->surface);
 	wl_display_roundtrip(ui.display);
 	_UIWaylandProcessPendingForWindow(window);
@@ -13419,31 +13216,11 @@ void _UIWindowSetCursor(UIWindow *window, int cursor) {
 	_UIWaylandApplyCursor(cursor);
 }
 
-// Wayland intentionally hides absolute screen coordinates from
-// clients. Returning (0, 0) means callers treat menu->pointX,
-// menu->pointY as window-local coords — which is exactly what
-// UIMenuShow's xdg_positioner needs anyway, so this isn't a stub so
-// much as a deliberate identity. If the upstream X11 backend uses
-// UIElementScreenBounds for something else (it does — UIMenuCreate
-// for non-root parents), the (0, 0) offset means screen bounds
-// equal element bounds. Works as long as no caller compares absolute
-// coords across windows.
+// Wayland hides absolute screen coords; identity returns make screen == element bounds.
 void _UIWindowGetScreenPosition(UIWindow *window, int *_x, int *_y) {
 	if (_x) *_x = 0;
 	if (_y) *_y = 0;
 }
-
-// Wayland clipboard is async (offer → receive(fd) → read pipe), but
-// luigi's API is synchronous. Bridge by pumping wl_display_dispatch
-// with a bounded timeout inside ReadText, the same pragmatic shape
-// most Wayland-native toolkits use. WriteText is naturally fire-and-
-// forget — the wl_data_source.send callback handles the actual
-// transfer when a peer requests it.
-//
-// pasteText ownership: WriteText takes the caller's malloc'd buffer.
-// We keep it alive (X11 backend does too) so wl_data_source.send can
-// read from it on demand. It's freed when replaced by a later
-// WriteText.
 
 char *_UIClipboardReadTextStart(UIWindow *window, size_t *bytes) {
 	if (bytes) *bytes = 0;
@@ -13484,9 +13261,6 @@ char *_UIClipboardReadTextStart(UIWindow *window, size_t *bytes) {
 	}
 	close(fds[0]);
 
-	// Null-terminate so callers that treat the buffer as a C string
-	// don't read past the end. luigi's textbox paste path uses the
-	// length explicitly, but the trailing NUL is cheap insurance.
 	char *nb = (char *) realloc(buf, len + 1);
 	if (nb) buf = nb;
 	buf[len] = '\0';
@@ -13500,8 +13274,6 @@ void _UIClipboardReadTextEnd(UIWindow *window, char *text) {
 
 void _UIClipboardWriteText(UIWindow *window, char *text) {
 	if (!ui.dataDevice || !ui.dataDeviceManager) {
-		// Compositor exposes neither global; no clipboard available.
-		// Caller transferred ownership of text, so free it.
 		free(text);
 		return;
 	}
@@ -13520,19 +13292,6 @@ void _UIClipboardWriteText(UIWindow *window, char *text) {
 	wl_data_device_set_selection(ui.dataDevice, source, ui.lastInputSerial);
 	if (previous) wl_data_source_destroy(previous);
 }
-
-// TODO step 9 (Wayland-only quality features):
-//   1. Fractional scaling: bind wp_fractional_scale_manager_v1 +
-//      wp_viewporter (both XMLs already vendored). For each
-//      UIWindow create a wp_fractional_scale_v1 on its surface;
-//      handle preferred_scale events. Multiply UI_SIZE_* through a
-//      per-window scale factor when measuring widgets.
-//   2. xdg_toplevel.set_parent for UIWindow's owner relationship
-//      so the compositor can stack/group them correctly.
-//   3. wl_data_device file-drop reception → UI_MSG_WINDOW_DROP_FILES.
-//   4. Re-add cursor-shape-v1 alongside the tablet-unstable-v2
-//      protocol (cursor-shape was deferred from MVP because its
-//      get_tablet_tool_v2 request requires the tablet binding).
 
 #endif
 
