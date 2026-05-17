@@ -46,7 +46,7 @@ gcc -O2 luigi_example.c -DUI_XORG -lX11 -lm -o luigi
 
 ```
 gcc -O2 luigi_example.c wayluigi_wayland.c -DUI_WAYLAND \
-    -lwayland-client -lxkbcommon -lrt -lm -o luigi
+    -lwayland-client -lwayland-cursor -lxkbcommon -lrt -lm -o luigi
 ```
 
 `wayluigi_wayland.c` ships pre-generated in this repo (concatenated

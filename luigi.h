@@ -26,6 +26,7 @@
 
 #ifdef UI_WAYLAND
 #include <wayland-client.h>
+#include <wayland-cursor.h>
 #include <xkbcommon/xkbcommon.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -3891,6 +3892,8 @@ typedef struct UIWindow {
 	struct wl_surface *surface;
 	struct xdg_surface *xdgSurface;
 	struct xdg_toplevel *xdgToplevel;
+	struct xdg_popup *xdgPopup;
+	struct zxdg_toplevel_decoration_v1 *xdgDecoration;
 	struct wl_buffer *bufferFront, *bufferBack;
 	void *shmData;
 	int shmSize, shmFd;
@@ -3898,6 +3901,9 @@ typedef struct UIWindow {
 	uint32_t pendingConfigureSerial;
 	bool pendingDirty;
 	bool isActive;
+	bool isMaximized, isFullscreen, isTiled, isSuspended;
+	bool isMenu;
+	struct UIWindow *waylandOwner;
 #endif
 
 #ifdef UI_WINDOWS
@@ -4237,6 +4243,7 @@ struct {
 	struct wl_compositor *compositor;
 	struct wl_shm *shm;
 	struct xdg_wm_base *xdgWmBase;
+	struct zxdg_decoration_manager_v1 *xdgDecorationManager;
 	struct wl_seat *seat;
 	struct wl_pointer *pointer;
 	struct wl_keyboard *keyboard;
@@ -9516,7 +9523,13 @@ static int _UIWaylandReallocBuffer(UIWindow *window, int width, int height) {
 	close(fd);
 
 	if (window->bufferFront) wl_buffer_destroy(window->bufferFront);
-	if (window->shmData && window->shmSize) munmap(window->shmData, window->shmSize);
+	if (window->shmData && window->shmSize) {
+		munmap(window->shmData, window->shmSize);
+	} else if (window->bits) {
+		// Pre-show menus use a malloc'd scratch buffer; free it now
+		// that we're switching to a real SHM-backed wl_buffer.
+		free(window->bits);
+	}
 
 	window->bufferFront = buffer;
 	window->shmData = data;
@@ -9543,14 +9556,28 @@ static void _UIWaylandXdgToplevelConfigure(void *data, struct xdg_toplevel *topl
 	window->pendingHeight = height;
 	window->pendingDirty = true;
 
-	bool activated = false;
+	bool activated = false, maximized = false, fullscreen = false, tiled = false, suspended = false;
 	uint32_t *state;
 	for (state = (uint32_t *) states->data;
 			(const char *) state < (const char *) states->data + states->size;
 			state++) {
-		if (*state == XDG_TOPLEVEL_STATE_ACTIVATED) activated = true;
+		switch (*state) {
+		case XDG_TOPLEVEL_STATE_ACTIVATED:   activated = true; break;
+		case XDG_TOPLEVEL_STATE_MAXIMIZED:   maximized = true; break;
+		case XDG_TOPLEVEL_STATE_FULLSCREEN:  fullscreen = true; break;
+		case XDG_TOPLEVEL_STATE_TILED_LEFT:
+		case XDG_TOPLEVEL_STATE_TILED_RIGHT:
+		case XDG_TOPLEVEL_STATE_TILED_TOP:
+		case XDG_TOPLEVEL_STATE_TILED_BOTTOM: tiled = true; break;
+		case XDG_TOPLEVEL_STATE_SUSPENDED:   suspended = true; break;
+		default: break;
+		}
 	}
 	window->isActive = activated;
+	window->isMaximized = maximized;
+	window->isFullscreen = fullscreen;
+	window->isTiled = tiled;
+	window->isSuspended = suspended;
 }
 
 static void _UIWaylandXdgToplevelClose(void *data, struct xdg_toplevel *toplevel) {
@@ -9575,6 +9602,332 @@ static const struct xdg_surface_listener _UIWaylandXdgSurfaceListener = {
 	_UIWaylandXdgSurfaceConfigure,
 };
 
+// xdg_popup listener: configure carries placement+size (we use only
+// size; the compositor's chosen x/y is already encoded in the
+// positioner). popup_done fires when the compositor dismisses the
+// popup (click-outside, Esc, etc.) and is treated as the user
+// closing the menu.
+
+static void _UIWaylandXdgPopupConfigure(void *data, struct xdg_popup *popup,
+		int32_t x, int32_t y, int32_t width, int32_t height) {
+	UIWindow *window = (UIWindow *) data;
+	if (width > 0 && height > 0) {
+		window->pendingWidth = width;
+		window->pendingHeight = height;
+		window->pendingDirty = true;
+	}
+}
+
+static void _UIWaylandXdgPopupDone(void *data, struct xdg_popup *popup) {
+	UIWindow *window = (UIWindow *) data;
+	UIElementMessage(&window->e, UI_MSG_WINDOW_CLOSE, 0, 0);
+}
+
+static void _UIWaylandXdgPopupRepositioned(void *data, struct xdg_popup *popup, uint32_t token) {}
+
+static const struct xdg_popup_listener _UIWaylandXdgPopupListener = {
+	_UIWaylandXdgPopupConfigure,
+	_UIWaylandXdgPopupDone,
+	_UIWaylandXdgPopupRepositioned,
+};
+
+// ----- Input: cursor theme, pointer, keyboard, seat -----
+//
+// evdev button codes from <linux/input-event-codes.h>, inlined to avoid
+// pulling in the kernel headers package as a build dep.
+#define _UI_BTN_LEFT   0x110
+#define _UI_BTN_RIGHT  0x111
+#define _UI_BTN_MIDDLE 0x112
+
+static struct {
+	struct wl_cursor_theme *theme;
+	struct wl_surface *surface;
+	struct wl_cursor *cursors[UI_CURSOR_COUNT];
+	uint32_t lastEnterSerial;
+	int current;
+} _UIWaylandCursor;
+
+static UIWindow *_UIWaylandPointerFocus;
+static UIWindow *_UIWaylandKeyboardFocus;
+
+static UIWindow *_UIWaylandFindWindow(struct wl_surface *surface) {
+	UIWindow *w = ui.windows;
+	while (w) {
+		if (w->surface == surface) return w;
+		w = w->next;
+	}
+	return NULL;
+}
+
+static void _UIWaylandApplyCursor(int cursorId) {
+	if (cursorId < 0 || cursorId >= UI_CURSOR_COUNT) cursorId = UI_CURSOR_ARROW;
+	if (!ui.pointer || !_UIWaylandCursor.surface) return;
+
+	struct wl_cursor *cursor = _UIWaylandCursor.cursors[cursorId];
+	if (!cursor) cursor = _UIWaylandCursor.cursors[UI_CURSOR_ARROW];
+	if (!cursor || cursor->image_count == 0) return;
+
+	struct wl_cursor_image *image = cursor->images[0];
+	struct wl_buffer *buffer = wl_cursor_image_get_buffer(image);
+	if (!buffer) return;
+
+	wl_pointer_set_cursor(ui.pointer, _UIWaylandCursor.lastEnterSerial,
+			_UIWaylandCursor.surface, image->hotspot_x, image->hotspot_y);
+	wl_surface_attach(_UIWaylandCursor.surface, buffer, 0, 0);
+	wl_surface_damage_buffer(_UIWaylandCursor.surface, 0, 0, image->width, image->height);
+	wl_surface_commit(_UIWaylandCursor.surface);
+	_UIWaylandCursor.current = cursorId;
+}
+
+static void _UIWaylandLoadCursors() {
+	// Cursor theme size and name come from the user's env; falling back
+	// to 24px is fine for most HiDPI-ish defaults.
+	const char *themeName = getenv("XCURSOR_THEME");
+	int size = 24;
+	const char *sizeEnv = getenv("XCURSOR_SIZE");
+	if (sizeEnv) {
+		int v = atoi(sizeEnv);
+		if (v > 0) size = v;
+	}
+
+	_UIWaylandCursor.theme = wl_cursor_theme_load(themeName, size, ui.shm);
+	_UIWaylandCursor.surface = wl_compositor_create_surface(ui.compositor);
+
+	// X11 cursorfont names; wl_cursor themes typically still ship these
+	// or alias them to CSS-style names.
+	static const char *const names[UI_CURSOR_COUNT] = {
+		[UI_CURSOR_ARROW]              = "left_ptr",
+		[UI_CURSOR_TEXT]               = "xterm",
+		[UI_CURSOR_SPLIT_V]            = "sb_v_double_arrow",
+		[UI_CURSOR_SPLIT_H]            = "sb_h_double_arrow",
+		[UI_CURSOR_FLIPPED_ARROW]      = "right_ptr",
+		[UI_CURSOR_CROSS_HAIR]         = "crosshair",
+		[UI_CURSOR_HAND]               = "hand1",
+		[UI_CURSOR_RESIZE_UP]          = "top_side",
+		[UI_CURSOR_RESIZE_LEFT]        = "left_side",
+		[UI_CURSOR_RESIZE_UP_RIGHT]    = "top_right_corner",
+		[UI_CURSOR_RESIZE_UP_LEFT]     = "top_left_corner",
+		[UI_CURSOR_RESIZE_DOWN]        = "bottom_side",
+		[UI_CURSOR_RESIZE_RIGHT]       = "right_side",
+		[UI_CURSOR_RESIZE_DOWN_LEFT]   = "bottom_left_corner",
+		[UI_CURSOR_RESIZE_DOWN_RIGHT]  = "bottom_right_corner",
+	};
+	if (!_UIWaylandCursor.theme) return;
+	for (int i = 0; i < UI_CURSOR_COUNT; i++) {
+		_UIWaylandCursor.cursors[i] = wl_cursor_theme_get_cursor(_UIWaylandCursor.theme, names[i]);
+	}
+}
+
+// Pointer listener
+
+static void _UIWaylandPointerEnter(void *data, struct wl_pointer *pointer, uint32_t serial,
+		struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {
+	UIWindow *window = _UIWaylandFindWindow(surface);
+	if (!window) return;
+	_UIWaylandPointerFocus = window;
+	_UIWaylandCursor.lastEnterSerial = serial;
+	window->cursorX = wl_fixed_to_int(sx);
+	window->cursorY = wl_fixed_to_int(sy);
+	_UIWaylandApplyCursor(UI_CURSOR_ARROW);
+	_UIWindowInputEvent(window, UI_MSG_MOUSE_MOVE, 0, 0);
+}
+
+static void _UIWaylandPointerLeave(void *data, struct wl_pointer *pointer, uint32_t serial,
+		struct wl_surface *surface) {
+	UIWindow *window = _UIWaylandFindWindow(surface);
+	if (window) {
+		if (!window->pressed) {
+			window->cursorX = -1;
+			window->cursorY = -1;
+		}
+		_UIWindowInputEvent(window, UI_MSG_MOUSE_MOVE, 0, 0);
+	}
+	if (_UIWaylandPointerFocus == window) _UIWaylandPointerFocus = NULL;
+}
+
+static void _UIWaylandPointerMotion(void *data, struct wl_pointer *pointer, uint32_t time,
+		wl_fixed_t sx, wl_fixed_t sy) {
+	UIWindow *window = _UIWaylandPointerFocus;
+	if (!window) return;
+	window->cursorX = wl_fixed_to_int(sx);
+	window->cursorY = wl_fixed_to_int(sy);
+	_UIWindowInputEvent(window, UI_MSG_MOUSE_MOVE, 0, 0);
+}
+
+static void _UIWaylandPointerButton(void *data, struct wl_pointer *pointer, uint32_t serial,
+		uint32_t time, uint32_t button, uint32_t state) {
+	UIWindow *window = _UIWaylandPointerFocus;
+	if (!window) return;
+	bool pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
+	UIMessage msg;
+	if (button == _UI_BTN_LEFT)       msg = pressed ? UI_MSG_LEFT_DOWN   : UI_MSG_LEFT_UP;
+	else if (button == _UI_BTN_MIDDLE) msg = pressed ? UI_MSG_MIDDLE_DOWN : UI_MSG_MIDDLE_UP;
+	else if (button == _UI_BTN_RIGHT)  msg = pressed ? UI_MSG_RIGHT_DOWN  : UI_MSG_RIGHT_UP;
+	else return;
+	_UIWindowInputEvent(window, msg, 0, 0);
+}
+
+static void _UIWaylandPointerAxis(void *data, struct wl_pointer *pointer, uint32_t time,
+		uint32_t axis, wl_fixed_t value) {
+	UIWindow *window = _UIWaylandPointerFocus;
+	if (!window) return;
+	if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) return;
+	// Wayland: positive value = scroll down. luigi: positive di = scroll
+	// down too. ~10.0 fixed per notch; luigi expects ~72 per notch.
+	int di = wl_fixed_to_int(value) * 7;
+	if (di == 0) return;
+	_UIWindowInputEvent(window, UI_MSG_MOUSE_WHEEL, di, 0);
+}
+
+static void _UIWaylandPointerFrame(void *data, struct wl_pointer *pointer) {}
+static void _UIWaylandPointerAxisSource(void *data, struct wl_pointer *pointer, uint32_t source) {}
+static void _UIWaylandPointerAxisStop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis) {}
+static void _UIWaylandPointerAxisDiscrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete) {}
+static void _UIWaylandPointerAxisValue120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120) {}
+static void _UIWaylandPointerAxisRelativeDirection(void *data, struct wl_pointer *pointer, uint32_t axis, uint32_t direction) {}
+
+static const struct wl_pointer_listener _UIWaylandPointerListener = {
+	_UIWaylandPointerEnter,
+	_UIWaylandPointerLeave,
+	_UIWaylandPointerMotion,
+	_UIWaylandPointerButton,
+	_UIWaylandPointerAxis,
+	_UIWaylandPointerFrame,
+	_UIWaylandPointerAxisSource,
+	_UIWaylandPointerAxisStop,
+	_UIWaylandPointerAxisDiscrete,
+	_UIWaylandPointerAxisValue120,
+	_UIWaylandPointerAxisRelativeDirection,
+};
+
+// Keyboard listener
+
+static void _UIWaylandKeyboardKeymap(void *data, struct wl_keyboard *keyboard,
+		uint32_t format, int32_t fd, uint32_t size) {
+	if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+		close(fd);
+		return;
+	}
+	char *mapped = (char *) mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (mapped == MAP_FAILED) {
+		close(fd);
+		return;
+	}
+	struct xkb_keymap *keymap = xkb_keymap_new_from_string(ui.xkbContext, mapped,
+			XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+	munmap(mapped, size);
+	close(fd);
+	if (!keymap) return;
+	struct xkb_state *state = xkb_state_new(keymap);
+	if (!state) {
+		xkb_keymap_unref(keymap);
+		return;
+	}
+	if (ui.xkbKeymap) xkb_keymap_unref(ui.xkbKeymap);
+	if (ui.xkbState) xkb_state_unref(ui.xkbState);
+	ui.xkbKeymap = keymap;
+	ui.xkbState = state;
+}
+
+static void _UIWaylandKeyboardEnter(void *data, struct wl_keyboard *keyboard,
+		uint32_t serial, struct wl_surface *surface, struct wl_array *keys) {
+	UIWindow *window = _UIWaylandFindWindow(surface);
+	if (!window) return;
+	_UIWaylandKeyboardFocus = window;
+	UIElementMessage(&window->e, UI_MSG_WINDOW_ACTIVATE, 0, 0);
+}
+
+static void _UIWaylandKeyboardLeave(void *data, struct wl_keyboard *keyboard,
+		uint32_t serial, struct wl_surface *surface) {
+	UIWindow *window = _UIWaylandFindWindow(surface);
+	if (_UIWaylandKeyboardFocus == window) _UIWaylandKeyboardFocus = NULL;
+	if (window) {
+		window->ctrl = window->shift = window->alt = false;
+		UIElementMessage(&window->e, UI_MSG_WINDOW_ACTIVATE, 0, 0);
+	}
+}
+
+static void _UIWaylandKeyboardKey(void *data, struct wl_keyboard *keyboard,
+		uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
+	UIWindow *window = _UIWaylandKeyboardFocus;
+	if (!window || !ui.xkbState) return;
+	if (state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
+
+	xkb_keycode_t keycode = key + 8;
+	xkb_keysym_t sym = xkb_state_key_get_one_sym(ui.xkbState, keycode);
+
+	char text[32];
+	int textBytes = xkb_state_key_get_utf8(ui.xkbState, keycode, text, sizeof(text));
+	if (textBytes < 0) textBytes = 0;
+
+	UIKeyTyped m = { 0 };
+	m.text = text;
+	m.textBytes = textBytes;
+	m.code = sym;
+	_UIWindowInputEvent(window, UI_MSG_KEY_TYPED, 0, &m);
+}
+
+static void _UIWaylandKeyboardModifiers(void *data, struct wl_keyboard *keyboard,
+		uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+	if (!ui.xkbState) return;
+	xkb_state_update_mask(ui.xkbState, depressed, latched, locked, 0, 0, group);
+	UIWindow *window = _UIWaylandKeyboardFocus;
+	if (!window) return;
+	bool ctrl  = xkb_state_mod_name_is_active(ui.xkbState, XKB_MOD_NAME_CTRL,  XKB_STATE_MODS_EFFECTIVE) > 0;
+	bool shift = xkb_state_mod_name_is_active(ui.xkbState, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0;
+	bool alt   = xkb_state_mod_name_is_active(ui.xkbState, XKB_MOD_NAME_ALT,   XKB_STATE_MODS_EFFECTIVE) > 0;
+	if (ctrl != window->ctrl || shift != window->shift || alt != window->alt) {
+		window->ctrl = ctrl;
+		window->shift = shift;
+		window->alt = alt;
+		_UIWindowInputEvent(window, UI_MSG_MOUSE_MOVE, 0, 0);
+	}
+}
+
+static void _UIWaylandKeyboardRepeatInfo(void *data, struct wl_keyboard *keyboard,
+		int32_t rate, int32_t delay) {
+	// MVP: key repeat handled by compositor or skipped.
+}
+
+static const struct wl_keyboard_listener _UIWaylandKeyboardListener = {
+	_UIWaylandKeyboardKeymap,
+	_UIWaylandKeyboardEnter,
+	_UIWaylandKeyboardLeave,
+	_UIWaylandKeyboardKey,
+	_UIWaylandKeyboardModifiers,
+	_UIWaylandKeyboardRepeatInfo,
+};
+
+// Seat listener — binds pointer / keyboard when capabilities arrive.
+
+static void _UIWaylandSeatCapabilities(void *data, struct wl_seat *seat, uint32_t caps) {
+	bool wantPointer  = caps & WL_SEAT_CAPABILITY_POINTER;
+	bool wantKeyboard = caps & WL_SEAT_CAPABILITY_KEYBOARD;
+
+	if (wantPointer && !ui.pointer) {
+		ui.pointer = wl_seat_get_pointer(seat);
+		wl_pointer_add_listener(ui.pointer, &_UIWaylandPointerListener, NULL);
+	} else if (!wantPointer && ui.pointer) {
+		wl_pointer_release(ui.pointer);
+		ui.pointer = NULL;
+	}
+
+	if (wantKeyboard && !ui.keyboard) {
+		ui.keyboard = wl_seat_get_keyboard(seat);
+		wl_keyboard_add_listener(ui.keyboard, &_UIWaylandKeyboardListener, NULL);
+	} else if (!wantKeyboard && ui.keyboard) {
+		wl_keyboard_release(ui.keyboard);
+		ui.keyboard = NULL;
+	}
+}
+
+static void _UIWaylandSeatName(void *data, struct wl_seat *seat, const char *name) {}
+
+static const struct wl_seat_listener _UIWaylandSeatListener = {
+	_UIWaylandSeatCapabilities,
+	_UIWaylandSeatName,
+};
+
 static void _UIWaylandRegistryGlobal(void *data, struct wl_registry *registry,
 		uint32_t name, const char *interface, uint32_t version) {
 	if (!strcmp(interface, wl_compositor_interface.name)) {
@@ -9584,8 +9937,11 @@ static void _UIWaylandRegistryGlobal(void *data, struct wl_registry *registry,
 	} else if (!strcmp(interface, xdg_wm_base_interface.name)) {
 		ui.xdgWmBase = (struct xdg_wm_base *) wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
 		xdg_wm_base_add_listener(ui.xdgWmBase, &_UIWaylandXdgWmBaseListener, NULL);
+	} else if (!strcmp(interface, zxdg_decoration_manager_v1_interface.name)) {
+		ui.xdgDecorationManager = (struct zxdg_decoration_manager_v1 *) wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1);
 	} else if (!strcmp(interface, wl_seat_interface.name)) {
 		ui.seat = (struct wl_seat *) wl_registry_bind(registry, name, &wl_seat_interface, 5);
+		wl_seat_add_listener(ui.seat, &_UIWaylandSeatListener, NULL);
 	}
 	// Output, decoration, fractional-scale, viewporter, etc. deferred.
 }
@@ -9630,6 +9986,9 @@ static void _UIWaylandProcessPendingForWindow(UIWindow *window) {
 	xdg_surface_ack_configure(window->xdgSurface, window->pendingConfigureSerial);
 	window->pendingDirty = false;
 
+	// ack_configure obligates the next commit to apply the new state.
+	// Paint immediately so the resize state machine doesn't stall
+	// (PLAN.md "Ack without commit" failure mode).
 	_UIUpdate();
 }
 
@@ -9647,8 +10006,18 @@ int _UIWindowMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	if (message == UI_MSG_DESTROY) {
 		UIWindow *window = (UIWindow *) element;
 		_UIWindowDestroyCommon(window);
+		if (_UIWaylandPointerFocus  == window) _UIWaylandPointerFocus  = NULL;
+		if (_UIWaylandKeyboardFocus == window) _UIWaylandKeyboardFocus = NULL;
 		if (window->bufferFront) wl_buffer_destroy(window->bufferFront);
-		if (window->shmData && window->shmSize) munmap(window->shmData, window->shmSize);
+		if (window->shmData && window->shmSize) {
+			munmap(window->shmData, window->shmSize);
+		} else if (window->bits) {
+			// Menus whose buffer never got upgraded to SHM (e.g.
+			// destroyed before UIMenuShow ran).
+			free(window->bits);
+		}
+		if (window->xdgPopup) xdg_popup_destroy(window->xdgPopup);
+		if (window->xdgDecoration) zxdg_toplevel_decoration_v1_destroy(window->xdgDecoration);
 		if (window->xdgToplevel) xdg_toplevel_destroy(window->xdgToplevel);
 		if (window->xdgSurface) xdg_surface_destroy(window->xdgSurface);
 		if (window->surface) wl_surface_destroy(window->surface);
@@ -9678,6 +10047,14 @@ void UIInitialise() {
 	}
 
 	ui.xkbContext = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+
+	// Second roundtrip: wl_seat.capabilities arrives async after the
+	// seat is bound, so we round-trip again to receive it and bind
+	// pointer/keyboard before returning control to the caller.
+	wl_display_roundtrip(ui.display);
+
+	// Cursor theme must come after we have ui.shm + ui.compositor bound.
+	_UIWaylandLoadCursors();
 }
 
 UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, int width, int height) {
@@ -9686,6 +10063,26 @@ UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, in
 	UIWindow *window = (UIWindow *) UIElementCreate(sizeof(UIWindow), NULL, flags | UI_ELEMENT_WINDOW, _UIWindowMessage, "Window");
 	_UIWindowAdd(window);
 	if (owner) window->scale = owner->scale;
+	window->waylandOwner = owner;
+
+	if (flags & UI_WINDOW_MENU) {
+		// Menus become xdg_popups, which need the parent's xdg_surface
+		// AND the menu's final size to construct an xdg_positioner.
+		// Both are only known at UIMenuShow time, so we defer the
+		// xdg_surface/xdg_popup chain to there. Until then, give the
+		// menu a tiny malloc'd scratch buffer so luigi's renderer can
+		// safely write into window->bits during element setup; the
+		// scratch is freed when _UIWaylandReallocBuffer swaps in the
+		// real SHM buffer from UIMenuShow.
+		window->isMenu = true;
+		window->surface = wl_compositor_create_surface(ui.compositor);
+		window->width = 1;
+		window->height = 1;
+		window->bits = (uint32_t *) calloc(1, sizeof(uint32_t));
+		window->e.bounds = UI_RECT_2S(1, 1);
+		window->e.clip = UI_RECT_2S(1, 1);
+		return window;
+	}
 
 	if (width <= 0) width = 800;
 	if (height <= 0) height = 600;
@@ -9698,6 +10095,17 @@ UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, in
 
 	if (cTitle) xdg_toplevel_set_title(window->xdgToplevel, cTitle);
 	xdg_toplevel_set_app_id(window->xdgToplevel, "wayluigi");
+
+	// Request server-side decorations. Mutter/KWin will honor this and
+	// draw a real titlebar+close button; Sway/Hyprland will refuse
+	// (replying CLIENT_SIDE) and the window will be borderless. We don't
+	// draw client-side decorations yet — that's a TODO.
+	if (ui.xdgDecorationManager) {
+		window->xdgDecoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
+				ui.xdgDecorationManager, window->xdgToplevel);
+		zxdg_toplevel_decoration_v1_set_mode(window->xdgDecoration,
+				ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+	}
 
 	// Initial dimensions before the first configure arrives. They may be
 	// overridden when the compositor proposes a different size.
@@ -9724,45 +10132,142 @@ bool _UIMessageLoopSingle(int *result) {
 		return false;
 	}
 	_UIWaylandProcessPending();
+	// Always repaint after a dispatch: input handlers (clicks, hovers,
+	// keypresses) dirty regions via UIElementRepaint but don't run a
+	// paint themselves. Without this call those changes only hit the
+	// screen the next time something else woke a redraw.
+	_UIUpdate();
 	return !ui.quit;
 }
 
 void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
 	if (!window->bufferFront) return;
-	int dx = painter->clip.l;
-	int dy = painter->clip.t;
-	int dw = painter->clip.r - painter->clip.l;
-	int dh = painter->clip.b - painter->clip.t;
+	// _UIElementPaint mutates painter->clip during recursion, so by the
+	// time we get here painter->clip is whatever rectangle the last
+	// painted leaf settled on — usually a tiny fragment of the actual
+	// dirty area. Use the window's accumulated updateRegion instead,
+	// which is what _UIUpdate used to seed the painter in the first
+	// place. (X11 has the same logical bug in its _UIWindowEndPaint
+	// but X11 servers redraw the whole window from a backing store, so
+	// nothing visibly breaks. On Wayland the undamaged regions of the
+	// buffer keep their previous on-screen content — that's where the
+	// drag-trail ghosts come from.)
+	UIRectangle r = UIRectangleIntersection(window->updateRegion,
+			UI_RECT_2S(window->width, window->height));
+	if (!UI_RECT_VALID(r)) return;
+	int dw = r.r - r.l;
+	int dh = r.b - r.t;
 	if (dw <= 0 || dh <= 0) return;
 	wl_surface_attach(window->surface, window->bufferFront, 0, 0);
-	wl_surface_damage_buffer(window->surface, dx, dy, dw, dh);
+	wl_surface_damage_buffer(window->surface, r.l, r.t, dw, dh);
 	wl_surface_commit(window->surface);
 }
 
 // ----- Remaining backend hooks (stubs until later steps) -----
 
+// TODO: X11 implements this via XResizeWindow. On Wayland we'd
+// xdg_toplevel.set_min_size + set_max_size to hint preferred size,
+// but compositors aren't obligated to honor it. Low priority — only
+// the X11 backend implemented this in upstream luigi; Win32 and
+// Essence don't either, so the public API is effectively X11-only.
 void UIWindowPack(UIWindow *window, int _width) {
 	WAYLUIGI_STUB("UIWindowPack");
 }
 
+// TODO: Thread-safe message posting. X11 uses a hack (custom XKeyEvent
+// + XSendEvent). Wayland equivalent would be an eventfd or pipe
+// wakeup from another thread, polled alongside wl_display_get_fd in
+// _UIMessageLoopSingle. Rarely used by single-threaded apps; defer.
 void UIWindowPostMessage(UIWindow *window, UIMessage message, void *_dp) {
 	WAYLUIGI_STUB("UIWindowPostMessage");
 }
 
 void UIMenuShow(UIMenu *menu) {
-	WAYLUIGI_STUB("UIMenuShow");
+	UIWindow *window = menu->e.window;
+	UIWindow *parent = window->waylandOwner;
+	if (!parent || !parent->xdgSurface) {
+		// Owner isn't a real toplevel — no surface to anchor on. Bail
+		// cleanly rather than producing a protocol error.
+		return;
+	}
+
+	int width, height;
+	_UIMenuPrepare(menu, &width, &height);
+	if (width <= 0) width = 1;
+	if (height <= 0) height = 1;
+
+	if (_UIWaylandReallocBuffer(window, width, height) < 0) return;
+	window->e.bounds = UI_RECT_2S(window->width, window->height);
+	window->e.clip = UI_RECT_2S(window->width, window->height);
+	UIElementMessage(&window->e, UI_MSG_LAYOUT, 0, 0);
+	window->updateRegion = UI_RECT_2S(window->width, window->height);
+
+	// xdg_positioner: 1×1 anchor rect at the cursor in the parent
+	// surface, with the menu growing down-right (gravity BOTTOM_RIGHT)
+	// and constrained to slide+resize if it would fall off-screen.
+	struct xdg_positioner *positioner = xdg_wm_base_create_positioner(ui.xdgWmBase);
+	xdg_positioner_set_size(positioner, width, height);
+	xdg_positioner_set_anchor_rect(positioner, menu->pointX, menu->pointY, 1, 1);
+	xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+	xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+	xdg_positioner_set_constraint_adjustment(positioner,
+			XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+			XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y |
+			XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X |
+			XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y);
+
+	window->xdgSurface = xdg_wm_base_get_xdg_surface(ui.xdgWmBase, window->surface);
+	xdg_surface_add_listener(window->xdgSurface, &_UIWaylandXdgSurfaceListener, window);
+	window->xdgPopup = xdg_surface_get_popup(window->xdgSurface, parent->xdgSurface, positioner);
+	xdg_popup_add_listener(window->xdgPopup, &_UIWaylandXdgPopupListener, window);
+	xdg_positioner_destroy(positioner);
+
+	// Grab on the seat using the most recent input serial we know
+	// about (pointer enter). xdg_popup.grab establishes click-outside
+	// dismissal; only the topmost popup in a chain should grab, but
+	// for the MVP every menu requests it — submenus inherit the
+	// parent's grab implicitly.
+	if (ui.seat && _UIWaylandCursor.lastEnterSerial) {
+		xdg_popup_grab(window->xdgPopup, ui.seat, _UIWaylandCursor.lastEnterSerial);
+	}
+
+	// Initial commit must be buffer-less (xdg_shell protocol). The
+	// compositor responds with configure events; the next dispatch
+	// cycle calls _UIWaylandProcessPendingForWindow which acks and
+	// paints.
+	wl_surface_commit(window->surface);
+	wl_display_roundtrip(ui.display);
+	_UIWaylandProcessPendingForWindow(window);
 }
 
 void _UIWindowSetCursor(UIWindow *window, int cursor) {
-	WAYLUIGI_STUB("_UIWindowSetCursor");
+	if (_UIWaylandPointerFocus != window) return;
+	if (_UIWaylandCursor.current == cursor) return;
+	_UIWaylandApplyCursor(cursor);
 }
 
+// Wayland intentionally hides absolute screen coordinates from
+// clients. Returning (0, 0) means callers treat menu->pointX,
+// menu->pointY as window-local coords — which is exactly what
+// UIMenuShow's xdg_positioner needs anyway, so this isn't a stub so
+// much as a deliberate identity. If the upstream X11 backend uses
+// UIElementScreenBounds for something else (it does — UIMenuCreate
+// for non-root parents), the (0, 0) offset means screen bounds
+// equal element bounds. Works as long as no caller compares absolute
+// coords across windows.
 void _UIWindowGetScreenPosition(UIWindow *window, int *_x, int *_y) {
-	WAYLUIGI_STUB("_UIWindowGetScreenPosition");
 	if (_x) *_x = 0;
 	if (_y) *_y = 0;
 }
 
+// TODO step 7: async clipboard via wl_data_device_manager.
+// Acquire a wl_data_device on the seat; for Read*, request a data
+// offer via wl_data_device.selection, write the receiving end of a
+// pipe to wl_data_offer.receive, pump wl_display_dispatch with a
+// bounded timeout until the read completes. For Write, create a
+// wl_data_source, advertise "text/plain;charset=utf-8" and
+// "UTF8_STRING", set as selection, handle wl_data_source.send by
+// writing to the offered fd.
 char *_UIClipboardReadTextStart(UIWindow *window, size_t *bytes) {
 	WAYLUIGI_STUB("_UIClipboardReadTextStart");
 	if (bytes) *bytes = 0;
@@ -9776,6 +10281,19 @@ void _UIClipboardReadTextEnd(UIWindow *window, char *text) {
 void _UIClipboardWriteText(UIWindow *window, char *text) {
 	WAYLUIGI_STUB("_UIClipboardWriteText");
 }
+
+// TODO step 9 (Wayland-only quality features):
+//   1. Fractional scaling: bind wp_fractional_scale_manager_v1 +
+//      wp_viewporter (both XMLs already vendored). For each
+//      UIWindow create a wp_fractional_scale_v1 on its surface;
+//      handle preferred_scale events. Multiply UI_SIZE_* through a
+//      per-window scale factor when measuring widgets.
+//   2. xdg_toplevel.set_parent for UIWindow's owner relationship
+//      so the compositor can stack/group them correctly.
+//   3. wl_data_device file-drop reception → UI_MSG_WINDOW_DROP_FILES.
+//   4. Re-add cursor-shape-v1 alongside the tablet-unstable-v2
+//      protocol (cursor-shape was deferred from MVP because its
+//      get_tablet_tool_v2 request requires the tablet binding).
 
 #endif
 
