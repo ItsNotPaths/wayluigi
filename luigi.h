@@ -9473,21 +9473,273 @@ const int UI_KEYCODE_TAB = XKB_KEY_Tab;
 const int UI_KEYCODE_UP = XKB_KEY_Up;
 const int UI_KEYCODE_INSERT = XKB_KEY_Insert;
 
-void UIInitialise() {
-	WAYLUIGI_STUB("UIInitialise");
-	_UIInitialiseCommon();
+// ----- SHM buffer management -----
+
+static int _UIWaylandCreateShmFd(int size) {
+	static int counter = 0;
+	char name[64];
+	snprintf(name, sizeof(name), "/wayluigi-%d-%d", (int) getpid(), ++counter);
+	int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) {
+		fprintf(stderr, "wayluigi: shm_open failed: %s\n", strerror(errno));
+		return -1;
+	}
+	shm_unlink(name);
+	if (ftruncate(fd, size) < 0) {
+		fprintf(stderr, "wayluigi: ftruncate failed: %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	return fd;
 }
 
-bool _UIMessageLoopSingle(int *result) {
-	WAYLUIGI_STUB("_UIMessageLoopSingle");
-	if (result) *result = 0;
-	return false;
+// Allocate a new shm-backed wl_buffer at (width, height) and bind it as
+// window->bufferFront / window->bits / window->shmData. Frees any prior
+// allocation. Returns 0 on success, -1 on failure.
+static int _UIWaylandReallocBuffer(UIWindow *window, int width, int height) {
+	if (width <= 0 || height <= 0) return -1;
+	int stride = width * 4;
+	int size = stride * height;
+
+	int fd = _UIWaylandCreateShmFd(size);
+	if (fd < 0) return -1;
+
+	void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (data == MAP_FAILED) {
+		close(fd);
+		return -1;
+	}
+
+	struct wl_shm_pool *pool = wl_shm_create_pool(ui.shm, fd, size);
+	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_XRGB8888);
+	wl_shm_pool_destroy(pool);
+	close(fd);
+
+	if (window->bufferFront) wl_buffer_destroy(window->bufferFront);
+	if (window->shmData && window->shmSize) munmap(window->shmData, window->shmSize);
+
+	window->bufferFront = buffer;
+	window->shmData = data;
+	window->shmSize = size;
+	window->bits = (uint32_t *) data;
+	window->width = width;
+	window->height = height;
+	return 0;
+}
+
+// ----- Listeners -----
+
+static void _UIWaylandXdgWmBasePing(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
+	xdg_wm_base_pong(wm_base, serial);
+}
+static const struct xdg_wm_base_listener _UIWaylandXdgWmBaseListener = {
+	_UIWaylandXdgWmBasePing,
+};
+
+static void _UIWaylandXdgToplevelConfigure(void *data, struct xdg_toplevel *toplevel,
+		int32_t width, int32_t height, struct wl_array *states) {
+	UIWindow *window = (UIWindow *) data;
+	window->pendingWidth = width;
+	window->pendingHeight = height;
+	window->pendingDirty = true;
+
+	bool activated = false;
+	uint32_t *state;
+	for (state = (uint32_t *) states->data;
+			(const char *) state < (const char *) states->data + states->size;
+			state++) {
+		if (*state == XDG_TOPLEVEL_STATE_ACTIVATED) activated = true;
+	}
+	window->isActive = activated;
+}
+
+static void _UIWaylandXdgToplevelClose(void *data, struct xdg_toplevel *toplevel) {
+	UIWindow *window = (UIWindow *) data;
+	if (!UIElementMessage(&window->e, UI_MSG_WINDOW_CLOSE, 0, 0)) {
+		ui.quit = true;
+	}
+}
+
+static const struct xdg_toplevel_listener _UIWaylandXdgToplevelListener = {
+	_UIWaylandXdgToplevelConfigure,
+	_UIWaylandXdgToplevelClose,
+};
+
+static void _UIWaylandXdgSurfaceConfigure(void *data, struct xdg_surface *xdg_surface, uint32_t serial) {
+	UIWindow *window = (UIWindow *) data;
+	window->pendingConfigureSerial = serial;
+	window->pendingDirty = true;
+}
+
+static const struct xdg_surface_listener _UIWaylandXdgSurfaceListener = {
+	_UIWaylandXdgSurfaceConfigure,
+};
+
+static void _UIWaylandRegistryGlobal(void *data, struct wl_registry *registry,
+		uint32_t name, const char *interface, uint32_t version) {
+	if (!strcmp(interface, wl_compositor_interface.name)) {
+		ui.compositor = (struct wl_compositor *) wl_registry_bind(registry, name, &wl_compositor_interface, 4);
+	} else if (!strcmp(interface, wl_shm_interface.name)) {
+		ui.shm = (struct wl_shm *) wl_registry_bind(registry, name, &wl_shm_interface, 1);
+	} else if (!strcmp(interface, xdg_wm_base_interface.name)) {
+		ui.xdgWmBase = (struct xdg_wm_base *) wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
+		xdg_wm_base_add_listener(ui.xdgWmBase, &_UIWaylandXdgWmBaseListener, NULL);
+	} else if (!strcmp(interface, wl_seat_interface.name)) {
+		ui.seat = (struct wl_seat *) wl_registry_bind(registry, name, &wl_seat_interface, 5);
+	}
+	// Output, decoration, fractional-scale, viewporter, etc. deferred.
+}
+
+static void _UIWaylandRegistryGlobalRemove(void *data, struct wl_registry *registry, uint32_t name) {
+	// MVP: don't track removals.
+}
+
+static const struct wl_registry_listener _UIWaylandRegistryListener = {
+	_UIWaylandRegistryGlobal,
+	_UIWaylandRegistryGlobalRemove,
+};
+
+// ----- Pending-configure processing -----
+//
+// The pattern from PLAN.md: configure handlers (inside dispatch) only
+// update `pending*` fields. After wl_display_dispatch returns to the
+// main loop, _UIWaylandProcessPending walks the window list and applies
+// the latest pending state: reallocate buffer if size changed, layout,
+// ack_configure, then paint via _UIUpdate (whose UI_MSG_PAINT path
+// terminates in _UIWindowEndPaint, which attaches+damages+commits).
+
+static void _UIWaylandProcessPendingForWindow(UIWindow *window) {
+	if (!window->pendingDirty) return;
+
+	int newW = window->pendingWidth;
+	int newH = window->pendingHeight;
+	if (newW <= 0 || newH <= 0) {
+		// Compositor said "client picks": use existing or default.
+		newW = window->width > 0 ? window->width : 800;
+		newH = window->height > 0 ? window->height : 600;
+	}
+
+	if (newW != window->width || newH != window->height || !window->bufferFront) {
+		if (_UIWaylandReallocBuffer(window, newW, newH) < 0) return;
+		window->e.bounds = UI_RECT_2S(window->width, window->height);
+		window->e.clip = UI_RECT_2S(window->width, window->height);
+		UIElementMessage(&window->e, UI_MSG_LAYOUT, 0, 0);
+		window->updateRegion = UI_RECT_2S(window->width, window->height);
+	}
+
+	xdg_surface_ack_configure(window->xdgSurface, window->pendingConfigureSerial);
+	window->pendingDirty = false;
+
+	_UIUpdate();
+}
+
+static void _UIWaylandProcessPending() {
+	UIWindow *window = ui.windows;
+	while (window) {
+		_UIWaylandProcessPendingForWindow(window);
+		window = window->next;
+	}
+}
+
+// ----- Per-backend window message handler -----
+
+int _UIWindowMessage(UIElement *element, UIMessage message, int di, void *dp) {
+	if (message == UI_MSG_DESTROY) {
+		UIWindow *window = (UIWindow *) element;
+		_UIWindowDestroyCommon(window);
+		if (window->bufferFront) wl_buffer_destroy(window->bufferFront);
+		if (window->shmData && window->shmSize) munmap(window->shmData, window->shmSize);
+		if (window->xdgToplevel) xdg_toplevel_destroy(window->xdgToplevel);
+		if (window->xdgSurface) xdg_surface_destroy(window->xdgSurface);
+		if (window->surface) wl_surface_destroy(window->surface);
+	}
+	return _UIWindowMessageCommon(element, message, di, dp);
+}
+
+// ----- Public entry points -----
+
+void UIInitialise() {
+	_UIInitialiseCommon();
+
+	ui.display = wl_display_connect(NULL);
+	if (!ui.display) {
+		fprintf(stderr, "wayluigi: wl_display_connect failed (is WAYLAND_DISPLAY set?)\n");
+		exit(1);
+	}
+
+	ui.registry = wl_display_get_registry(ui.display);
+	wl_registry_add_listener(ui.registry, &_UIWaylandRegistryListener, NULL);
+	wl_display_roundtrip(ui.display);
+
+	if (!ui.compositor || !ui.shm || !ui.xdgWmBase) {
+		fprintf(stderr, "wayluigi: compositor missing required globals (compositor=%p shm=%p xdg_wm_base=%p)\n",
+				(void *) ui.compositor, (void *) ui.shm, (void *) ui.xdgWmBase);
+		exit(1);
+	}
+
+	ui.xkbContext = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 }
 
 UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, int width, int height) {
-	WAYLUIGI_STUB("UIWindowCreate");
-	return NULL;
+	_UIMenusClose();
+
+	UIWindow *window = (UIWindow *) UIElementCreate(sizeof(UIWindow), NULL, flags | UI_ELEMENT_WINDOW, _UIWindowMessage, "Window");
+	_UIWindowAdd(window);
+	if (owner) window->scale = owner->scale;
+
+	if (width <= 0) width = 800;
+	if (height <= 0) height = 600;
+
+	window->surface = wl_compositor_create_surface(ui.compositor);
+	window->xdgSurface = xdg_wm_base_get_xdg_surface(ui.xdgWmBase, window->surface);
+	xdg_surface_add_listener(window->xdgSurface, &_UIWaylandXdgSurfaceListener, window);
+	window->xdgToplevel = xdg_surface_get_toplevel(window->xdgSurface);
+	xdg_toplevel_add_listener(window->xdgToplevel, &_UIWaylandXdgToplevelListener, window);
+
+	if (cTitle) xdg_toplevel_set_title(window->xdgToplevel, cTitle);
+	xdg_toplevel_set_app_id(window->xdgToplevel, "wayluigi");
+
+	// Initial dimensions before the first configure arrives. They may be
+	// overridden when the compositor proposes a different size.
+	window->pendingWidth = width;
+	window->pendingHeight = height;
+
+	// xdg_shell requires the initial commit have no buffer. The compositor
+	// responds with a configure carrying the agreed-upon size.
+	wl_surface_commit(window->surface);
+
+	// Block here until first configure arrives and is applied. This gives
+	// callers a window with valid width/height/bits before they start
+	// creating child elements against it.
+	wl_display_roundtrip(ui.display);
+	_UIWaylandProcessPendingForWindow(window);
+
+	return window;
 }
+
+bool _UIMessageLoopSingle(int *result) {
+	wl_display_flush(ui.display);
+	if (wl_display_dispatch(ui.display) < 0) {
+		ui.quit = true;
+		return false;
+	}
+	_UIWaylandProcessPending();
+	return !ui.quit;
+}
+
+void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
+	if (!window->bufferFront) return;
+	int dx = painter->clip.l;
+	int dy = painter->clip.t;
+	int dw = painter->clip.r - painter->clip.l;
+	int dh = painter->clip.b - painter->clip.t;
+	if (dw <= 0 || dh <= 0) return;
+	wl_surface_attach(window->surface, window->bufferFront, 0, 0);
+	wl_surface_damage_buffer(window->surface, dx, dy, dw, dh);
+	wl_surface_commit(window->surface);
+}
+
+// ----- Remaining backend hooks (stubs until later steps) -----
 
 void UIWindowPack(UIWindow *window, int _width) {
 	WAYLUIGI_STUB("UIWindowPack");
@@ -9499,10 +9751,6 @@ void UIWindowPostMessage(UIWindow *window, UIMessage message, void *_dp) {
 
 void UIMenuShow(UIMenu *menu) {
 	WAYLUIGI_STUB("UIMenuShow");
-}
-
-void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
-	WAYLUIGI_STUB("_UIWindowEndPaint");
 }
 
 void _UIWindowSetCursor(UIWindow *window, int cursor) {
