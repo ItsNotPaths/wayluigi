@@ -29,11 +29,11 @@ PROTOCOLS=(
     xdg-decoration-unstable-v1
     fractional-scale-v1
     viewporter
-    # cursor-shape-v1: deferred. Its get_tablet_tool_v2 request makes
-    # the generated bindings depend on zwp_tablet_tool_v2_interface
-    # from the tablet protocol. MVP uses the wl_cursor theme fallback
-    # (PLAN.md step 4) instead. Re-add cursor-shape-v1 alongside
-    # tablet-unstable-v2 when we want nicer cursors.
+    # tablet-unstable-v2 must come before cursor-shape-v1: the latter's
+    # get_tablet_tool_v2 request references zwp_tablet_tool_v2_interface
+    # and the references must be declared before they are used.
+    tablet-unstable-v2
+    cursor-shape-v1
 )
 
 OUT_C=wayluigi_wayland.c
