@@ -32,11 +32,28 @@ cl /O2 luigi_example.c user32.lib gdi32.lib shell32.lib
 
 ### Linux
 
-Update `luigi_example.c` to `#define UI_LINUX` at the top of the file, and then run the following command in Bash:
+Two backends are available; pick one at compile time with `-D`.
+
+**X11** (`UI_XORG`, kept identical to upstream nakst's `UI_LINUX`):
 
 ```
-gcc -O2 luigi_example.c -lX11 -lm -o luigi
+gcc -O2 luigi_example.c -DUI_XORG -lX11 -lm -o luigi
 ```
+
+`UI_LINUX` still works as a synonym for backwards compatibility.
+
+**Wayland** (`UI_WAYLAND`, this fork):
+
+```
+gcc -O2 luigi_example.c wayluigi_wayland.c -DUI_WAYLAND \
+    -lwayland-client -lxkbcommon -lrt -lm -o luigi
+```
+
+`wayluigi_wayland.c` ships pre-generated in this repo (concatenated
+`wayland-scanner` output for xdg-shell, xdg-decoration, fractional-scale,
+and viewporter). You don't need `wayland-scanner` to build. If you ever
+want to regenerate it — for example to update a protocol version — run
+`./regen-wayland.sh` (requires `wayland-devel`).
 
 ## Linking with FreeType
 
@@ -57,7 +74,7 @@ UIFontActivate(UIFontCreate("font_path.ttf", 11 /* font size */));
 ### Introduction
 
 As with other single-header libraries, to use it in your project define `UI_IMPLEMENTATION` in exactly one translation unit where you include the header. 
-Furthermore, everytime you include the header, you must either define `UI_WINDOWS` or `UI_LINUX` to specify the target platform.
+Furthermore, every time you include the header, you must define exactly one of `UI_WINDOWS`, `UI_XORG` (or its synonym `UI_LINUX`), or `UI_WAYLAND` to specify the target platform.
 
 To initialise the library, call `UIInitialise`. You can then create a window using `UIWindowCreate` and populate it using the `UI...Create` functions. 
 Once you're ready, call `UIMessageLoop`, and input messages will start being processed.
@@ -84,7 +101,7 @@ The user will likely want to set `messageUser` so that they can receive the `UI_
 The following source code demonstrates how to create an empty window.
 
 ```c
-// Define UI_LINUX instead if you're on Linux.
+// Define UI_XORG (X11) or UI_WAYLAND instead if you're on Linux.
 #define UI_WINDOWS 
 
 // Put the library implementation in this translation unit.

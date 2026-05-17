@@ -1,6 +1,7 @@
 #include <stdio.h>
 
-// #define UI_LINUX
+// #define UI_XORG    // X11 (synonym: UI_LINUX)
+// #define UI_WAYLAND  // Wayland (this fork)
 // #define UI_WINDOWS
 // #define UI_DEBUG
 #define UI_IMPLEMENTATION
@@ -122,7 +123,7 @@ int MyTableMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	return 0;
 }
 
-#ifdef UI_LINUX
+#if defined(UI_LINUX) || defined(UI_WAYLAND)
 int main(int argc, char **argv) {
 #else
 int WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR commandLine, int showCommand) {
