@@ -12397,23 +12397,26 @@ static UIWindow *_UIWaylandFindWindow(struct wl_surface *surface) {
 	return NULL;
 }
 
-// luigi cursor → cursor-shape-v1 shape enum. Indices match UI_CURSOR_*.
+// luigi cursor → cursor-shape-v1 shape enum. Ordered to match
+// UI_CURSOR_* enum values exactly (positional initializers, since
+// designated-array-initializers aren't accepted by g++ in C++ mode
+// and this header is included from C++ examples too).
 static const uint32_t _UIWaylandCursorShapeMap[UI_CURSOR_COUNT] = {
-	[UI_CURSOR_ARROW]             = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT,
-	[UI_CURSOR_TEXT]              = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT,
-	[UI_CURSOR_SPLIT_V]           = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ROW_RESIZE,
-	[UI_CURSOR_SPLIT_H]           = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE,
-	[UI_CURSOR_FLIPPED_ARROW]     = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CONTEXT_MENU,
-	[UI_CURSOR_CROSS_HAIR]        = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CROSSHAIR,
-	[UI_CURSOR_HAND]              = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER,
-	[UI_CURSOR_RESIZE_UP]         = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_N_RESIZE,
-	[UI_CURSOR_RESIZE_LEFT]       = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_W_RESIZE,
-	[UI_CURSOR_RESIZE_UP_RIGHT]   = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NE_RESIZE,
-	[UI_CURSOR_RESIZE_UP_LEFT]    = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NW_RESIZE,
-	[UI_CURSOR_RESIZE_DOWN]       = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_S_RESIZE,
-	[UI_CURSOR_RESIZE_RIGHT]      = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_E_RESIZE,
-	[UI_CURSOR_RESIZE_DOWN_LEFT]  = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SW_RESIZE,
-	[UI_CURSOR_RESIZE_DOWN_RIGHT] = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SE_RESIZE,
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT,       // UI_CURSOR_ARROW
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT,          // UI_CURSOR_TEXT
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ROW_RESIZE,    // UI_CURSOR_SPLIT_V
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE,    // UI_CURSOR_SPLIT_H
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CONTEXT_MENU,  // UI_CURSOR_FLIPPED_ARROW
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CROSSHAIR,     // UI_CURSOR_CROSS_HAIR
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER,       // UI_CURSOR_HAND
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_N_RESIZE,      // UI_CURSOR_RESIZE_UP
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_W_RESIZE,      // UI_CURSOR_RESIZE_LEFT
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NE_RESIZE,     // UI_CURSOR_RESIZE_UP_RIGHT
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NW_RESIZE,     // UI_CURSOR_RESIZE_UP_LEFT
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_S_RESIZE,      // UI_CURSOR_RESIZE_DOWN
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_E_RESIZE,      // UI_CURSOR_RESIZE_RIGHT
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SE_RESIZE,     // UI_CURSOR_RESIZE_DOWN_RIGHT
+	WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SW_RESIZE,     // UI_CURSOR_RESIZE_DOWN_LEFT
 };
 
 static void _UIWaylandApplyCursor(int cursorId) {
@@ -12461,23 +12464,25 @@ static void _UIWaylandLoadCursors() {
 	_UIWaylandCursor.surface = wl_compositor_create_surface(ui.compositor);
 
 	// X11 cursorfont names; wl_cursor themes typically still ship these
-	// or alias them to CSS-style names.
+	// or alias them to CSS-style names. Positional initializers ordered
+	// to match UI_CURSOR_* values — designated-array-initializers don't
+	// survive a C++ compile.
 	static const char *const names[UI_CURSOR_COUNT] = {
-		[UI_CURSOR_ARROW]              = "left_ptr",
-		[UI_CURSOR_TEXT]               = "xterm",
-		[UI_CURSOR_SPLIT_V]            = "sb_v_double_arrow",
-		[UI_CURSOR_SPLIT_H]            = "sb_h_double_arrow",
-		[UI_CURSOR_FLIPPED_ARROW]      = "right_ptr",
-		[UI_CURSOR_CROSS_HAIR]         = "crosshair",
-		[UI_CURSOR_HAND]               = "hand1",
-		[UI_CURSOR_RESIZE_UP]          = "top_side",
-		[UI_CURSOR_RESIZE_LEFT]        = "left_side",
-		[UI_CURSOR_RESIZE_UP_RIGHT]    = "top_right_corner",
-		[UI_CURSOR_RESIZE_UP_LEFT]     = "top_left_corner",
-		[UI_CURSOR_RESIZE_DOWN]        = "bottom_side",
-		[UI_CURSOR_RESIZE_RIGHT]       = "right_side",
-		[UI_CURSOR_RESIZE_DOWN_LEFT]   = "bottom_left_corner",
-		[UI_CURSOR_RESIZE_DOWN_RIGHT]  = "bottom_right_corner",
+		"left_ptr",            // UI_CURSOR_ARROW
+		"xterm",               // UI_CURSOR_TEXT
+		"sb_v_double_arrow",   // UI_CURSOR_SPLIT_V
+		"sb_h_double_arrow",   // UI_CURSOR_SPLIT_H
+		"right_ptr",           // UI_CURSOR_FLIPPED_ARROW
+		"crosshair",           // UI_CURSOR_CROSS_HAIR
+		"hand1",               // UI_CURSOR_HAND
+		"top_side",            // UI_CURSOR_RESIZE_UP
+		"left_side",           // UI_CURSOR_RESIZE_LEFT
+		"top_right_corner",    // UI_CURSOR_RESIZE_UP_RIGHT
+		"top_left_corner",     // UI_CURSOR_RESIZE_UP_LEFT
+		"bottom_side",         // UI_CURSOR_RESIZE_DOWN
+		"right_side",          // UI_CURSOR_RESIZE_RIGHT
+		"bottom_right_corner", // UI_CURSOR_RESIZE_DOWN_RIGHT
+		"bottom_left_corner",  // UI_CURSOR_RESIZE_DOWN_LEFT
 	};
 	if (!_UIWaylandCursor.theme) return;
 	for (int i = 0; i < UI_CURSOR_COUNT; i++) {
