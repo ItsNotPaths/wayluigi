@@ -13117,11 +13117,27 @@ UIWindow *UIWindowCreate(UIWindow *owner, uint32_t flags, const char *cTitle, in
 
 bool _UIMessageLoopSingle(int *result) {
 	wl_display_flush(ui.display);
-	if (wl_display_dispatch(ui.display) < 0) {
-		ui.quit = true;
-		return false;
+
+	while (wl_display_prepare_read(ui.display) != 0) {
+		wl_display_dispatch_pending(ui.display);
 	}
+	wl_display_flush(ui.display);
+
+	struct pollfd pfd = { wl_display_get_fd(ui.display), POLLIN, 0 };
+	int timeout = ui.animating ? 20 : -1; // ~50 Hz when animating, block otherwise.
+	int n = poll(&pfd, 1, timeout);
+	if (n > 0 && (pfd.revents & POLLIN)) {
+		if (wl_display_read_events(ui.display) < 0) {
+			ui.quit = true;
+			return false;
+		}
+		wl_display_dispatch_pending(ui.display);
+	} else {
+		wl_display_cancel_read(ui.display);
+	}
+
 	_UIWaylandProcessPending();
+	if (ui.animating) _UIProcessAnimations();
 	_UIUpdate(); // input handlers dirty regions but don't paint themselves.
 	return !ui.quit;
 }
