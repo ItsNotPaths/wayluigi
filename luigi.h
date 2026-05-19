@@ -6605,13 +6605,26 @@ typedef struct UIWindow {
 	struct zxdg_toplevel_decoration_v1 *xdgDecoration;
 	struct wp_fractional_scale_v1 *fractionalScale;
 	struct wp_viewport *viewport;
-	struct wl_buffer *bufferFront, *bufferBack;
+	// Triple-buffer: three wl_buffers in three planes of one shm region.
+	// Each buffer tracks compositor-busy state via wl_buffer.release, so the
+	// renderer's next paint always lands on a buffer that's actually free,
+	// not just one we hope the compositor has finished with. memcpy from
+	// the just-committed plane to the freshly-picked one keeps luigi's
+	// damage-region paint sitting on the latest baseline.
+	struct wl_buffer *bufferFront, *bufferBack; // legacy fields, replaced by buffers[]
+	struct wl_buffer *buffers[3];
+	uint32_t *bitsPlanes[3];
+	bool busy[3];
+	int currentIdx;             // index of plane bits currently points at
 	void *shmData;
 	int shmSize, shmFd;
 	int pendingWidth, pendingHeight; // in logical (compositor) coords
 	int pendingScale; // raw numerator from preferred_scale; 120 == 1.0×
 	uint32_t pendingConfigureSerial;
 	bool pendingDirty;
+	bool hasReceivedConfigure; // becomes true on first ack_configure;
+		// gates _UIWindowEndPaint so a buffer is never attached to an
+		// xdg_surface that hasn't completed its initial handshake.
 	bool isActive;
 	bool isMaximized, isFullscreen, isTiled, isSuspended;
 	bool isMenu;
@@ -12216,38 +12229,66 @@ static int _UIWaylandCreateShmFd(int size) {
 	return fd;
 }
 
+// Per-slot release listeners. Each marks its dedicated slot free when the
+// compositor releases the buffer; the EndPaint picker reads these.
+static void _UIWaylandBufferRelease0(void *d, struct wl_buffer *b) { ((UIWindow *) d)->busy[0] = false; }
+static void _UIWaylandBufferRelease1(void *d, struct wl_buffer *b) { ((UIWindow *) d)->busy[1] = false; }
+static void _UIWaylandBufferRelease2(void *d, struct wl_buffer *b) { ((UIWindow *) d)->busy[2] = false; }
+static const struct wl_buffer_listener _UIWaylandBufferListener0 = { _UIWaylandBufferRelease0 };
+static const struct wl_buffer_listener _UIWaylandBufferListener1 = { _UIWaylandBufferRelease1 };
+static const struct wl_buffer_listener _UIWaylandBufferListener2 = { _UIWaylandBufferRelease2 };
+static const struct wl_buffer_listener *_UIWaylandBufferListeners[3] = {
+	&_UIWaylandBufferListener0, &_UIWaylandBufferListener1, &_UIWaylandBufferListener2,
+};
+
 static int _UIWaylandReallocBuffer(UIWindow *window, int width, int height) {
+	// Three wl_buffers, three planes in one shm region. See struct comment.
 	if (width <= 0 || height <= 0) return -1;
 	int stride = width * 4;
-	int size = stride * height;
+	int planeSize = stride * height;
+	int totalSize = planeSize * 3;
 
-	int fd = _UIWaylandCreateShmFd(size);
+	int fd = _UIWaylandCreateShmFd(totalSize);
 	if (fd < 0) return -1;
 
-	void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	void *data = mmap(NULL, totalSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (data == MAP_FAILED) {
 		close(fd);
 		return -1;
 	}
 
-	struct wl_shm_pool *pool = wl_shm_create_pool(ui.shm, fd, size);
-	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_XRGB8888);
+	struct wl_shm_pool *pool = wl_shm_create_pool(ui.shm, fd, totalSize);
+	struct wl_buffer *bufs[3];
+	for (int i = 0; i < 3; i++) {
+		bufs[i] = wl_shm_pool_create_buffer(pool, i * planeSize,
+				width, height, stride, WL_SHM_FORMAT_XRGB8888);
+	}
 	wl_shm_pool_destroy(pool);
 	close(fd);
 
-	if (window->bufferFront) wl_buffer_destroy(window->bufferFront);
+	for (int i = 0; i < 3; i++) {
+		if (window->buffers[i]) wl_buffer_destroy(window->buffers[i]);
+	}
 	if (window->shmData && window->shmSize) {
 		munmap(window->shmData, window->shmSize);
 	} else if (window->bits) {
 		free(window->bits); // pre-show menu scratch buffer.
 	}
 
-	window->bufferFront = buffer;
 	window->shmData = data;
-	window->shmSize = size;
-	window->bits = (uint32_t *) data;
-	window->width = width;
+	window->shmSize = totalSize;
+	for (int i = 0; i < 3; i++) {
+		window->buffers[i] = bufs[i];
+		window->bitsPlanes[i] = (uint32_t *) ((char *) data + i * planeSize);
+		window->busy[i] = false;
+		wl_buffer_add_listener(bufs[i], _UIWaylandBufferListeners[i], window);
+	}
+	window->currentIdx = 0;
+	window->bits   = window->bitsPlanes[0];
+	window->width  = width;
 	window->height = height;
+	window->bufferFront = NULL; // legacy; cleanup goes through buffers[].
+	window->bufferBack  = NULL;
 	return 0;
 }
 
@@ -12983,6 +13024,7 @@ static void _UIWaylandProcessPendingForWindow(UIWindow *window) {
 	}
 
 	xdg_surface_ack_configure(window->xdgSurface, window->pendingConfigureSerial);
+	window->hasReceivedConfigure = true; // unlocks _UIWindowEndPaint commits.
 	window->pendingDirty = false;
 	_UIUpdate(); // ack obligates a commit; don't stall the resize FSM.
 }
@@ -12998,14 +13040,27 @@ static void _UIWaylandProcessPending() {
 int _UIWindowMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	if (message == UI_MSG_DESTROY) {
 		UIWindow *window = (UIWindow *) element;
+		// window->bits may point into mmap'd shm memory (after
+		// _UIWaylandReallocBuffer) OR be a malloc'd pre-show menu scratch
+		// buffer. _UIWindowDestroyCommon does an unconditional free() on
+		// it; misusing the mmap pointer crashes (segfault on the second
+		// menu show / on first close of a menu that ran the realloc).
+		// Detach it here and let the explicit cleanup below do the right
+		// thing based on whether shmData is set.
+		void *scratchBits = window->shmData ? NULL : window->bits;
+		window->bits = NULL;
 		_UIWindowDestroyCommon(window);
 		if (_UIWaylandPointerFocus  == window) _UIWaylandPointerFocus  = NULL;
 		if (_UIWaylandKeyboardFocus == window) _UIWaylandKeyboardFocus = NULL;
+		for (int i = 0; i < 3; i++) {
+			if (window->buffers[i]) wl_buffer_destroy(window->buffers[i]);
+		}
 		if (window->bufferFront) wl_buffer_destroy(window->bufferFront);
+		if (window->bufferBack)  wl_buffer_destroy(window->bufferBack);
 		if (window->shmData && window->shmSize) {
 			munmap(window->shmData, window->shmSize);
-		} else if (window->bits) {
-			free(window->bits);
+		} else if (scratchBits) {
+			free(scratchBits);
 		}
 		if (window->xdgPopup) xdg_popup_destroy(window->xdgPopup);
 		if (window->xdgDecoration) zxdg_toplevel_decoration_v1_destroy(window->xdgDecoration);
@@ -13143,18 +13198,52 @@ bool _UIMessageLoopSingle(int *result) {
 }
 
 void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
-	if (!window->bufferFront) return;
+	if (!window->buffers[0]) return;
+	// Never attach a buffer before the surface's first xdg_surface.configure
+	// has been acked — Sway/wlroots reject with `unconfigured_buffer`
+	// (xdg_surface error 3). The pending paint isn't lost: the next
+	// _UIWaylandProcessPendingForWindow runs an ack and re-paints.
+	if (!window->hasReceivedConfigure) return;
 	// HACK: painter->clip is mutated by _UIElementPaint recursion. Damage
 	// from window->updateRegion instead, or drag trails ghost on Wayland.
 	UIRectangle r = UIRectangleIntersection(window->updateRegion,
 			UI_RECT_2S(window->width, window->height));
 	if (!UI_RECT_VALID(r)) return;
-	int dw = r.r - r.l;
-	int dh = r.b - r.t;
+	int dw = r.r - r.l, dh = r.b - r.t;
 	if (dw <= 0 || dh <= 0) return;
-	wl_surface_attach(window->surface, window->bufferFront, 0, 0);
+
+	// Triple-buffer: renderer wrote into bitsPlanes[currentIdx]. Attach
+	// that slot's wl_buffer + commit. Mark it busy. Drain pending wayland
+	// events so any already-arrived release flips its slot back to free.
+	// Pick the next free slot for the next paint. memcpy keeps damage
+	// region paints sitting on the latest baseline.
+	int cur = window->currentIdx;
+	wl_surface_attach(window->surface, window->buffers[cur], 0, 0);
 	wl_surface_damage_buffer(window->surface, r.l, r.t, dw, dh);
 	wl_surface_commit(window->surface);
+	window->busy[cur] = true;
+
+	// Synchronously drain protocol: send our commit + wait for server to
+	// process it and ship back any wl_buffer.release events. Without this
+	// the dispatch_pending path consumes pointer/keyboard noise faster
+	// than buffer.release events arrive, all 3 slots stay busy, and the
+	// picker fallback reuses the slot the compositor is still scanning —
+	// the shimmer the user was seeing during scroll/typing bursts.
+	wl_display_roundtrip(ui.display);
+
+	int next = -1;
+	for (int i = 0; i < 3; i++) {
+		int idx = (cur + 1 + i) % 3;
+		if (!window->busy[idx]) { next = idx; break; }
+	}
+	if (next < 0) next = cur; // shouldn't happen after roundtrip; safe fallback
+
+	int planeSize = window->shmSize / 3;
+	if (next != cur) {
+		memcpy(window->bitsPlanes[next], window->bitsPlanes[cur], planeSize);
+	}
+	window->bits       = window->bitsPlanes[next];
+	window->currentIdx = next;
 }
 
 // Best-effort: compositor may ignore (X11's XResizeWindow same caveat).
