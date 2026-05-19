@@ -12680,17 +12680,26 @@ static void _UIWaylandKeyboardLeave(void *data, struct wl_keyboard *keyboard,
 static void _UIWaylandKeyboardKey(void *data, struct wl_keyboard *keyboard,
 		uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
 	UIWindow *window = _UIWaylandKeyboardFocus;
-	if (!window || !ui.xkbState) return;
+	if (!window || !ui.xkbState || !ui.xkbKeymap) return;
 	ui.lastInputSerial = serial;
 
 	xkb_keycode_t keycode = key + 8;
-	xkb_keysym_t sym = xkb_state_key_get_one_sym(ui.xkbState, keycode);
+	// Match the X11 path (XLookupKeysym(xkey, 0)): take the *base* keysym
+	// from the active layout at level 0, ignoring Shift / Caps / etc.
+	// xkb_state_key_get_one_sym bakes the modifier state in, so Shift+Tab
+	// arrives as XKB_KEY_ISO_Left_Tab and Shift+letter as the uppercase
+	// keysym — chord-matching against UI_KEYCODE_TAB / UI_KEYCODE_LETTER
+	// (which carry the unshifted values) then silently misses.
+	xkb_layout_index_t layout = xkb_state_key_get_layout(ui.xkbState, keycode);
+	const xkb_keysym_t *syms;
+	int nsyms = xkb_keymap_key_get_syms_by_level(ui.xkbKeymap, keycode, layout, 0, &syms);
+	xkb_keysym_t baseSym = (nsyms > 0) ? syms[0] : XKB_KEY_NoSymbol;
 
 	if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
 		// Release. Only stop the repeater if it's the same key we're
 		// currently spamming — a release for a different key (e.g.
 		// user released Shift while still holding J) must not cancel.
-		if (_UIWaylandKeyRepeatActive && sym == _UIWaylandKeyRepeatSym) {
+		if (_UIWaylandKeyRepeatActive && baseSym == _UIWaylandKeyRepeatSym) {
 			_UIWaylandKeyRepeatCancel();
 		}
 		return;
@@ -12703,7 +12712,20 @@ static void _UIWaylandKeyboardKey(void *data, struct wl_keyboard *keyboard,
 	UIKeyTyped m = { 0 };
 	m.text = text;
 	m.textBytes = textBytes;
-	m.code = sym;
+	m.code = baseSym;
+
+	// Mirror the X11 keypad remap (luigi.h X11 path): numpad arrows / nav
+	// keys arrive as KP_* keysyms regardless of NumLock state, but consumers
+	// expect the directional UI_KEYCODE_* values.
+	if      (baseSym == XKB_KEY_KP_Left)   m.code = UI_KEYCODE_LEFT;
+	else if (baseSym == XKB_KEY_KP_Right)  m.code = UI_KEYCODE_RIGHT;
+	else if (baseSym == XKB_KEY_KP_Up)     m.code = UI_KEYCODE_UP;
+	else if (baseSym == XKB_KEY_KP_Down)   m.code = UI_KEYCODE_DOWN;
+	else if (baseSym == XKB_KEY_KP_Home)   m.code = UI_KEYCODE_HOME;
+	else if (baseSym == XKB_KEY_KP_End)    m.code = UI_KEYCODE_END;
+	else if (baseSym == XKB_KEY_KP_Enter)  m.code = UI_KEYCODE_ENTER;
+	else if (baseSym == XKB_KEY_KP_Delete) m.code = UI_KEYCODE_DELETE;
+
 	_UIWindowInputEvent(window, UI_MSG_KEY_TYPED, 0, &m);
 
 	// Arm the repeater unless the compositor disabled repeat (rate == 0)
@@ -12712,7 +12734,7 @@ static void _UIWaylandKeyboardKey(void *data, struct wl_keyboard *keyboard,
 	if (_UIWaylandKeyRepeatRate > 0 && ui.xkbKeymap &&
 			xkb_keymap_key_repeats(ui.xkbKeymap, keycode)) {
 		_UIWaylandKeyRepeatActive = true;
-		_UIWaylandKeyRepeatSym = sym;
+		_UIWaylandKeyRepeatSym = baseSym;
 		_UIWaylandKeyRepeatWindow = window;
 		_UIWaylandKeyRepeatTextBytes = textBytes;
 		if (textBytes > 0)
