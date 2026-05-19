@@ -6625,6 +6625,10 @@ typedef struct UIWindow {
 	bool hasReceivedConfigure; // becomes true on first ack_configure;
 		// gates _UIWindowEndPaint so a buffer is never attached to an
 		// xdg_surface that hasn't completed its initial handshake.
+	bool framePending; // true between a commit + frame_callback fire.
+		// Paint is gated on !framePending in _UIUpdate so we attach +
+		// commit at most once per compositor refresh. Prevents recursive
+		// EndPaint when pointer/keyboard events arrive during dispatch.
 	bool isActive;
 	bool isMaximized, isFullscreen, isTiled, isSuspended;
 	bool isMenu;
@@ -10378,7 +10382,14 @@ void _UIUpdate() {
 		} else {
 			link = &window->next;
 
-			if (UI_RECT_VALID(window->updateRegion)) {
+			if (UI_RECT_VALID(window->updateRegion)
+#ifdef UI_WAYLAND
+				// Hold off painting until the compositor's frame callback fires.
+				// Keeps updateRegion intact so the accumulated dirty area gets
+				// painted on the next eligible loop tick.
+				&& !window->framePending
+#endif
+				) {
 #ifdef __cplusplus
 				UIPainter painter = {};
 #else
@@ -12241,6 +12252,19 @@ static const struct wl_buffer_listener *_UIWaylandBufferListeners[3] = {
 	&_UIWaylandBufferListener0, &_UIWaylandBufferListener1, &_UIWaylandBufferListener2,
 };
 
+// wl_surface.frame callback. Fires when the compositor is ready to receive
+// the next frame (i.e. ~vsync). Clears framePending so the next _UIUpdate
+// can paint. The callback is one-shot per wl_surface_frame request — we
+// rearm by requesting a new one in EndPaint on the next commit.
+static void _UIWaylandFrameDone(void *data, struct wl_callback *cb, uint32_t time) {
+	UIWindow *window = (UIWindow *) data;
+	window->framePending = false;
+	wl_callback_destroy(cb);
+}
+static const struct wl_callback_listener _UIWaylandFrameListener = {
+	_UIWaylandFrameDone,
+};
+
 static int _UIWaylandReallocBuffer(UIWindow *window, int width, int height) {
 	// Three wl_buffers, three planes in one shm region. See struct comment.
 	if (width <= 0 || height <= 0) return -1;
@@ -13213,30 +13237,36 @@ void _UIWindowEndPaint(UIWindow *window, UIPainter *painter) {
 	if (dw <= 0 || dh <= 0) return;
 
 	// Triple-buffer: renderer wrote into bitsPlanes[currentIdx]. Attach
-	// that slot's wl_buffer + commit. Mark it busy. Drain pending wayland
-	// events so any already-arrived release flips its slot back to free.
-	// Pick the next free slot for the next paint. memcpy keeps damage
-	// region paints sitting on the latest baseline.
+	// that slot's wl_buffer + commit. Mark it busy. Pick the next free slot
+	// for the next paint; memcpy keeps partial-damage paints sitting on
+	// the latest baseline.
+	//
+	// Pacing: a wl_surface.frame callback is requested before commit. The
+	// callback fires at the next compositor refresh, clearing framePending.
+	// _UIUpdate gates paints on !framePending, so we commit at most once
+	// per refresh. This replaces an earlier wl_display_roundtrip-based
+	// pacing scheme that caused recursive EndPaint — pointer/keyboard
+	// event callbacks dispatched during the roundtrip call _UIWindowInputEvent
+	// → _UIUpdate → _UIWindowEndPaint, which re-attaches the same slot
+	// and stomps the outer call's currentIdx. Frame-callback gating keeps
+	// EndPaint non-reentrant by ensuring _UIUpdate skips windows mid-frame.
 	int cur = window->currentIdx;
 	wl_surface_attach(window->surface, window->buffers[cur], 0, 0);
 	wl_surface_damage_buffer(window->surface, r.l, r.t, dw, dh);
+
+	struct wl_callback *fc = wl_surface_frame(window->surface);
+	wl_callback_add_listener(fc, &_UIWaylandFrameListener, window);
+	window->framePending = true;
+
 	wl_surface_commit(window->surface);
 	window->busy[cur] = true;
-
-	// Synchronously drain protocol: send our commit + wait for server to
-	// process it and ship back any wl_buffer.release events. Without this
-	// the dispatch_pending path consumes pointer/keyboard noise faster
-	// than buffer.release events arrive, all 3 slots stay busy, and the
-	// picker fallback reuses the slot the compositor is still scanning —
-	// the shimmer the user was seeing during scroll/typing bursts.
-	wl_display_roundtrip(ui.display);
 
 	int next = -1;
 	for (int i = 0; i < 3; i++) {
 		int idx = (cur + 1 + i) % 3;
 		if (!window->busy[idx]) { next = idx; break; }
 	}
-	if (next < 0) next = cur; // shouldn't happen after roundtrip; safe fallback
+	if (next < 0) next = cur; // very rare: all 3 in flight. Re-uses cur.
 
 	int planeSize = window->shmSize / 3;
 	if (next != cur) {
