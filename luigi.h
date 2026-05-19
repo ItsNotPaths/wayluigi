@@ -12427,6 +12427,31 @@ static struct {
 static UIWindow *_UIWaylandPointerFocus;
 static UIWindow *_UIWaylandKeyboardFocus;
 
+// Wayland key-repeat state. The compositor tells us its desired rate
+// (chars/sec) and delay (ms before first repeat) once at startup via
+// wl_keyboard::repeat_info; from then on we synthesize KEY_TYPED events
+// from the message-loop poll timeout. X11 gets repeat for free from the
+// X server, so this whole machinery is Wayland-only.
+static int32_t _UIWaylandKeyRepeatRate;        // 0 = no repeat
+static int32_t _UIWaylandKeyRepeatDelay;       // ms before first synthesized repeat
+static bool     _UIWaylandKeyRepeatActive;
+static uint64_t _UIWaylandKeyRepeatNextMs;
+static xkb_keysym_t _UIWaylandKeyRepeatSym;
+static char     _UIWaylandKeyRepeatText[32];
+static int      _UIWaylandKeyRepeatTextBytes;
+static UIWindow *_UIWaylandKeyRepeatWindow;
+
+static uint64_t _UIWaylandNowMs(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
+}
+
+static void _UIWaylandKeyRepeatCancel(void) {
+	_UIWaylandKeyRepeatActive = false;
+	_UIWaylandKeyRepeatWindow = NULL;
+}
+
 static UIWindow *_UIWaylandFindWindow(struct wl_surface *surface) {
 	UIWindow *w = ui.windows;
 	while (w) {
@@ -12646,6 +12671,10 @@ static void _UIWaylandKeyboardLeave(void *data, struct wl_keyboard *keyboard,
 		window->ctrl = window->shift = window->alt = false;
 		UIElementMessage(&window->e, UI_MSG_WINDOW_ACTIVATE, 0, 0);
 	}
+	// Losing focus drops any in-flight repeat — otherwise switching
+	// windows mid-hold leaves us spamming KEY_TYPED into a window the
+	// user's no longer looking at.
+	_UIWaylandKeyRepeatCancel();
 }
 
 static void _UIWaylandKeyboardKey(void *data, struct wl_keyboard *keyboard,
@@ -12653,10 +12682,19 @@ static void _UIWaylandKeyboardKey(void *data, struct wl_keyboard *keyboard,
 	UIWindow *window = _UIWaylandKeyboardFocus;
 	if (!window || !ui.xkbState) return;
 	ui.lastInputSerial = serial;
-	if (state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
 
 	xkb_keycode_t keycode = key + 8;
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(ui.xkbState, keycode);
+
+	if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
+		// Release. Only stop the repeater if it's the same key we're
+		// currently spamming — a release for a different key (e.g.
+		// user released Shift while still holding J) must not cancel.
+		if (_UIWaylandKeyRepeatActive && sym == _UIWaylandKeyRepeatSym) {
+			_UIWaylandKeyRepeatCancel();
+		}
+		return;
+	}
 
 	char text[32];
 	int textBytes = xkb_state_key_get_utf8(ui.xkbState, keycode, text, sizeof(text));
@@ -12667,6 +12705,22 @@ static void _UIWaylandKeyboardKey(void *data, struct wl_keyboard *keyboard,
 	m.textBytes = textBytes;
 	m.code = sym;
 	_UIWindowInputEvent(window, UI_MSG_KEY_TYPED, 0, &m);
+
+	// Arm the repeater unless the compositor disabled repeat (rate == 0)
+	// or the keymap declares this key non-repeating (modifiers, etc.).
+	// Last-press-wins: a fresh press overwrites any active repeat.
+	if (_UIWaylandKeyRepeatRate > 0 && ui.xkbKeymap &&
+			xkb_keymap_key_repeats(ui.xkbKeymap, keycode)) {
+		_UIWaylandKeyRepeatActive = true;
+		_UIWaylandKeyRepeatSym = sym;
+		_UIWaylandKeyRepeatWindow = window;
+		_UIWaylandKeyRepeatTextBytes = textBytes;
+		if (textBytes > 0)
+			memcpy(_UIWaylandKeyRepeatText, text, (size_t) textBytes);
+		_UIWaylandKeyRepeatNextMs = _UIWaylandNowMs() + (uint64_t) _UIWaylandKeyRepeatDelay;
+	} else {
+		_UIWaylandKeyRepeatCancel();
+	}
 }
 
 static void _UIWaylandKeyboardModifiers(void *data, struct wl_keyboard *keyboard,
@@ -12688,6 +12742,10 @@ static void _UIWaylandKeyboardModifiers(void *data, struct wl_keyboard *keyboard
 
 static void _UIWaylandKeyboardRepeatInfo(void *data, struct wl_keyboard *keyboard,
 		int32_t rate, int32_t delay) {
+	// rate is in chars/sec; 0 means "disabled" per the wl_keyboard spec.
+	_UIWaylandKeyRepeatRate = rate;
+	_UIWaylandKeyRepeatDelay = delay;
+	if (rate <= 0) _UIWaylandKeyRepeatCancel();
 }
 
 static const struct wl_keyboard_listener _UIWaylandKeyboardListener = {
@@ -13204,6 +13262,15 @@ bool _UIMessageLoopSingle(int *result) {
 
 	struct pollfd pfd = { wl_display_get_fd(ui.display), POLLIN, 0 };
 	int timeout = ui.animating ? 20 : -1; // ~50 Hz when animating, block otherwise.
+	// If a key is being held, clamp the poll timeout to the next repeat
+	// fire — otherwise we'd block in poll() until the user touched
+	// something else and miss the repeat tick.
+	if (_UIWaylandKeyRepeatActive) {
+		uint64_t now = _UIWaylandNowMs();
+		int repeatTimeout = (_UIWaylandKeyRepeatNextMs <= now)
+				? 0 : (int) (_UIWaylandKeyRepeatNextMs - now);
+		if (timeout < 0 || repeatTimeout < timeout) timeout = repeatTimeout;
+	}
 	int n = poll(&pfd, 1, timeout);
 	if (n > 0 && (pfd.revents & POLLIN)) {
 		if (wl_display_read_events(ui.display) < 0) {
@@ -13213,6 +13280,26 @@ bool _UIMessageLoopSingle(int *result) {
 		wl_display_dispatch_pending(ui.display);
 	} else {
 		wl_display_cancel_read(ui.display);
+	}
+
+	// Synthesize any due key repeats. The while-loop covers wakes that
+	// slept longer than one repeat interval (e.g. when something else
+	// briefly blocked the loop) — emits the missed events in order
+	// rather than collapsing them.
+	if (_UIWaylandKeyRepeatActive && _UIWaylandKeyRepeatWindow) {
+		uint64_t now = _UIWaylandNowMs();
+		uint64_t step = (uint64_t) (1000 / (_UIWaylandKeyRepeatRate > 0
+				? _UIWaylandKeyRepeatRate : 25));
+		if (step == 0) step = 1;
+		while (_UIWaylandKeyRepeatActive && now >= _UIWaylandKeyRepeatNextMs) {
+			UIKeyTyped m = { 0 };
+			m.text = _UIWaylandKeyRepeatText;
+			m.textBytes = _UIWaylandKeyRepeatTextBytes;
+			m.code = _UIWaylandKeyRepeatSym;
+			_UIWindowInputEvent(_UIWaylandKeyRepeatWindow,
+					UI_MSG_KEY_TYPED, 0, &m);
+			_UIWaylandKeyRepeatNextMs += step;
+		}
 	}
 
 	_UIWaylandProcessPending();
